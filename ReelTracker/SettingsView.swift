@@ -1,0 +1,171 @@
+//
+//  SettingsView.swift
+//  ReelTracker
+//
+//  Updated on 5/4/25 to correctly calculate and display distance for theatres within 50 miles
+//
+import SwiftUI
+import CoreLocation
+
+/// Local model for display, including distance from user
+struct TheatreLocation: Identifiable {
+    let id: Int
+    let name: String
+    let postalCode: String?
+    let coordinate: CLLocationCoordinate2D
+    let distance: Double    // miles
+}
+
+final class SettingsViewModel: ObservableObject {
+    @Published var zipCode: String = ""
+    @Published var isLoading: Bool = false
+    @Published var theatres: [TheatreLocation] = []
+    @Published var selectedIds: Set<Int> = []
+
+    private let geocoder = CLGeocoder()
+    private var userLocation: CLLocation?
+
+    /// Only the selected theatres
+    var selectedTheatres: [TheatreLocation] {
+        theatres.filter { selectedIds.contains($0.id) }
+    }
+
+    /// 1) Geocode the ZIP -> userLocation
+    /// 2) Fetch via postal-code filter
+    /// 3) Filter to ≤ 50 miles and compute distance
+    func lookupTheatres() {
+        // Validate 5-digit ZIP
+        guard zipCode.count == 5, Int(zipCode) != nil else { return }
+        isLoading = true
+        theatres = []
+
+        // Geocode ZIP to lat/lon
+        geocoder.geocodeAddressString(zipCode) { placemarks, error in
+            guard let loc = placemarks?.first?.location else {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.theatres = []
+                }
+                return
+            }
+            self.userLocation = loc
+
+            // Fetch theatres with postal-code filter
+            AMCAPIClient.shared.fetchTheatres(
+                pageNumber: 1,
+                pageSize: 1000,
+                postalCode: self.zipCode
+            ) { result in
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    switch result {
+                    case .success(let resp):
+                        guard let userLoc = self.userLocation else {
+                            self.theatres = []
+                            return
+                        }
+                        // Map and filter
+                        let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
+                            guard
+                                let lat = th.location?.latitude,
+                                let lon = th.location?.longitude
+                            else { return nil }
+                            let theatreLoc = CLLocation(latitude: lat, longitude: lon)
+                            let distMiles = theatreLoc.distance(from: userLoc) / 1609.34
+                            guard distMiles <= 50 else { return nil }
+                            return TheatreLocation(
+                                id: th.id,
+                                name: th.name,
+                                postalCode: th.location?.postalCode,
+                                coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                                distance: distMiles
+                            )
+                        }
+                        // Sort by nearest first
+                        self.theatres = nearby.sorted { $0.distance < $1.distance }
+
+                    case .failure(let error):
+                        print("Error fetching theatres: \(error)")
+                        self.theatres = []
+                    }
+                }
+            }
+        }
+    }
+
+    /// Toggle a theatre's selection
+    func toggleSelection(_ theatre: TheatreLocation) {
+        if selectedIds.contains(theatre.id) {
+            selectedIds.remove(theatre.id)
+        } else {
+            selectedIds.insert(theatre.id)
+        }
+    }
+}
+
+struct SettingsView: View {
+    @EnvironmentObject var settings: SettingsViewModel
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Enter ZIP Code")) {
+                    TextField("ZIP Code", text: $settings.zipCode)
+                        .keyboardType(.numberPad)
+                    Button("Search Theatres") {
+                        settings.lookupTheatres()
+                    }
+                    .disabled(!(settings.zipCode.count == 5 && Int(settings.zipCode) != nil))
+                }
+
+                Section(header: Text("Theatres within 50 miles")) {
+                    if settings.isLoading {
+                        ProgressView("Loading…")
+                    } else if settings.theatres.isEmpty {
+                        Text("No theatres found within 50 miles of ZIP \(settings.zipCode).")
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(settings.theatres) { theatre in
+                            Button {
+                                settings.toggleSelection(theatre)
+                            } label: {
+                                HStack(alignment: .top) {
+                                    Image(systemName: settings.selectedIds.contains(theatre.id)
+                                          ? "checkmark.circle.fill" : "circle")
+                                    VStack(alignment: .leading) {
+                                        Text(theatre.name)
+                                        if let pc = theatre.postalCode {
+                                            Text(pc)
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Text(String(format: "%.1f mi", theatre.distance))
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                if !settings.selectedTheatres.isEmpty {
+                    Section(header: Text("Selected Theatres")) {
+                        ForEach(settings.selectedTheatres) { t in
+                            Text(t.name)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Settings")
+        }
+    }
+}
+
+struct SettingsView_Previews: PreviewProvider {
+    static var previews: some View {
+        SettingsView()
+            .environmentObject(SettingsViewModel())
+    }
+}
