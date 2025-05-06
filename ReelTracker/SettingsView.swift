@@ -2,8 +2,9 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 5/4/25 to correctly calculate and display distance for theatres within 50 miles
+//  Updated on 5/6/25 to persist ZIP code and selected theatre IDs
 //
+
 import SwiftUI
 import CoreLocation
 
@@ -17,10 +18,25 @@ struct TheatreLocation: Identifiable {
 }
 
 final class SettingsViewModel: ObservableObject {
-    @Published var zipCode: String = ""
+    // MARK: – UserDefaults keys
+    private let zipCodeKey = "zipCode"
+    private let selectedIdsKey = "selectedTheatreIds"
+
+    // MARK: – Published properties with persistence
+    @Published var zipCode: String {
+        didSet {
+            UserDefaults.standard.set(zipCode, forKey: zipCodeKey)
+        }
+    }
+
+    @Published var selectedIds: Set<Int> {
+        didSet {
+            UserDefaults.standard.set(Array(selectedIds), forKey: selectedIdsKey)
+        }
+    }
+
     @Published var isLoading: Bool = false
     @Published var theatres: [TheatreLocation] = []
-    @Published var selectedIds: Set<Int> = []
 
     private let geocoder = CLGeocoder()
     private var userLocation: CLLocation?
@@ -30,11 +46,26 @@ final class SettingsViewModel: ObservableObject {
         theatres.filter { selectedIds.contains($0.id) }
     }
 
+    init() {
+        // Load saved ZIP (or default to empty)
+        self.zipCode = UserDefaults.standard.string(forKey: zipCodeKey) ?? ""
+        // Load saved theatre IDs (or default to empty set)
+        if let saved = UserDefaults.standard.array(forKey: selectedIdsKey) as? [Int] {
+            self.selectedIds = Set(saved)
+        } else {
+            self.selectedIds = []
+        }
+
+        // If we already have a valid ZIP, perform the lookup immediately
+        if zipCode.count == 5 {
+            lookupTheatres()
+        }
+    }
+
     /// 1) Geocode the ZIP -> userLocation
     /// 2) Fetch via postal-code filter
     /// 3) Filter to ≤ 50 miles and compute distance
     func lookupTheatres() {
-        // Validate 5-digit ZIP
         guard zipCode.count == 5, Int(zipCode) != nil else { return }
         isLoading = true
         theatres = []
@@ -64,24 +95,23 @@ final class SettingsViewModel: ObservableObject {
                             self.theatres = []
                             return
                         }
-                        // Map and filter
+                        // Map and filter by distance
                         let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
                             guard
                                 let lat = th.location?.latitude,
                                 let lon = th.location?.longitude
                             else { return nil }
                             let theatreLoc = CLLocation(latitude: lat, longitude: lon)
-                            let distMiles = theatreLoc.distance(from: userLoc) / 1609.34
-                            guard distMiles <= 50 else { return nil }
+                            let miles = theatreLoc.distance(from: userLoc) / 1609.34
+                            guard miles <= 50 else { return nil }
                             return TheatreLocation(
                                 id: th.id,
                                 name: th.name,
                                 postalCode: th.location?.postalCode,
                                 coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                                distance: distMiles
+                                distance: miles
                             )
                         }
-                        // Sort by nearest first
                         self.theatres = nearby.sorted { $0.distance < $1.distance }
 
                     case .failure(let error):
@@ -93,7 +123,7 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
-    /// Toggle a theatre's selection
+    /// Toggle a theatre's selection and persist
     func toggleSelection(_ theatre: TheatreLocation) {
         if selectedIds.contains(theatre.id) {
             selectedIds.remove(theatre.id)

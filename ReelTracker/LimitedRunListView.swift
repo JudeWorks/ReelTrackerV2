@@ -9,6 +9,7 @@ struct LimitedMovie: Identifiable {
     let nextShowingUrl: String
     let posterUrl: String
     let limitedRun: Bool
+    let theatreIds: Set<Int>
 }
 
 /// ViewModel for fetching and filtering limited-run movies
@@ -19,7 +20,7 @@ final class LimitedRunViewModel: ObservableObject {
     private let threshold = 10
     private let daysWindow = 60
 
-    // Formatter to parse local showtime strings (e.g., "2025-05-03T19:30:00")
+    // Formatter to parse local showtime strings
     private let localFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
@@ -27,7 +28,7 @@ final class LimitedRunViewModel: ObservableObject {
         return f
     }()
 
-    // ISO formatter for releaseDateUtc if needed
+    // ISO formatter for releaseDateUtc
     private let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
@@ -42,7 +43,8 @@ final class LimitedRunViewModel: ObservableObject {
         }
 
         isLoading = true
-        var allShowtimes: [Showtime] = []
+        // Tag showtimes as tuples: (theatreId, showtime)
+        var allTagged: [(theatreId: Int, showtime: Showtime)] = []
         let showtimeGroup = DispatchGroup()
 
         // 1) Fetch showtimes for each theatre
@@ -56,30 +58,36 @@ final class LimitedRunViewModel: ObservableObject {
                 pageSize: 1000
             ) { result in
                 if case .success(let resp) = result {
-                    allShowtimes.append(contentsOf: resp._embedded.showtimes)
+                    resp._embedded.showtimes.forEach { st in
+                        allTagged.append((theatreId: theatreId, showtime: st))
+                    }
                 }
                 showtimeGroup.leave()
             }
         }
 
-        // 2) Aggregate and fetch movie details
+        // 2) Once all showtimes are gathered
         showtimeGroup.notify(queue: .main, execute: {
             let now = Date()
+            // Map movieId to counts, dates, urls, and theatre sets
             var counts: [Int: Int] = [:]
             var nextDates: [Int: Date] = [:]
             var nextUrls: [Int: String] = [:]
+            let movieToTheatres: [Int: Set<Int>] = Dictionary(
+                grouping: allTagged,
+                by: { $0.showtime.movieId }
+            ).mapValues { Set($0.map { $0.theatreId }) }
 
-            // Aggregate showtime counts and earliest next showing
-            for st in allShowtimes {
-                counts[st.movieId, default: 0] += 1
-                // Parse local showtime
-                if let dt = self.localFormatter.date(from: st.showDateTimeLocal), dt >= now {
-                    if let existing = nextDates[st.movieId], dt < existing {
-                        nextDates[st.movieId] = dt
-                        nextUrls[st.movieId] = st.purchaseUrl
-                    } else if nextDates[st.movieId] == nil {
-                        nextDates[st.movieId] = dt
-                        nextUrls[st.movieId] = st.purchaseUrl
+            for tagged in allTagged {
+                let movieId = tagged.showtime.movieId
+                counts[movieId, default: 0] += 1
+                if let dt = self.localFormatter.date(from: tagged.showtime.showDateTimeLocal), dt >= now {
+                    if let existing = nextDates[movieId], dt < existing {
+                        nextDates[movieId] = dt
+                        nextUrls[movieId] = tagged.showtime.purchaseUrl
+                    } else if nextDates[movieId] == nil {
+                        nextDates[movieId] = dt
+                        nextUrls[movieId] = tagged.showtime.purchaseUrl
                     }
                 }
             }
@@ -87,9 +95,9 @@ final class LimitedRunViewModel: ObservableObject {
             // 3) Fetch movie details by ID
             let movieGroup = DispatchGroup()
             var movies: [Movie] = []
-            for mid in counts.keys {
+            for movieId in counts.keys {
                 movieGroup.enter()
-                AMCAPIClient.shared.fetchMoviesByIds(ids: [mid]) { result in
+                AMCAPIClient.shared.fetchMoviesByIds(ids: [movieId]) { result in
                     if case .success(let resp) = result {
                         movies.append(contentsOf: resp._embedded.movies)
                     }
@@ -97,35 +105,32 @@ final class LimitedRunViewModel: ObservableObject {
                 }
             }
 
-            // 4) Build limited-run list, sort by nextShowing ascending
+            // 4) Build limited-run list and sort by nextShowing
             movieGroup.notify(queue: .main, execute: {
-                var limited: [LimitedMovie] = []
-                for m in movies {
+                let limited = movies.compactMap { m -> LimitedMovie? in
                     let count = counts[m.id] ?? 0
                     let next = nextDates[m.id]
                     let url = nextUrls[m.id] ?? ""
-                    // Compute days since release
                     var daysOld: Int? = nil
                     if let rdStr = m.releaseDateUtc,
                        let rd = self.isoFormatter.date(from: rdStr) {
                         daysOld = Calendar.current.dateComponents([.day], from: rd, to: now).day
                     }
                     let isLimited = (daysOld ?? Int.max) <= self.daysWindow && count < self.threshold
-                    limited.append(
-                        LimitedMovie(
-                            id: m.id,
-                            name: m.name,
-                            showtimeCount: count,
-                            nextShowing: next,
-                            nextShowingUrl: url,
-                            posterUrl: m.media?.posterDynamic ?? "",
-                            limitedRun: isLimited
-                        )
+                    guard isLimited else { return nil }
+                    let theatres = movieToTheatres[m.id] ?? []
+                    return LimitedMovie(
+                        id: m.id,
+                        name: m.name,
+                        showtimeCount: count,
+                        nextShowing: next,
+                        nextShowingUrl: url,
+                        posterUrl: m.media?.posterDynamic ?? "",
+                        limitedRun: isLimited,
+                        theatreIds: theatres
                     )
                 }
-                // Filter and sort: movies with nearest nextShowing first
                 self.limitedMovies = limited
-                    .filter { $0.limitedRun }
                     .sorted { a, b in
                         let aDate = a.nextShowing ?? Date.distantFuture
                         let bDate = b.nextShowing ?? Date.distantFuture
@@ -142,7 +147,7 @@ struct LimitedRunListView: View {
     @EnvironmentObject var settings: SettingsViewModel
     @StateObject private var vm = LimitedRunViewModel()
 
-    /// Formatter for displaying the next showing in a user-friendly style
+    /// Formatter for displaying the next showing
     private static let displayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .medium
@@ -172,23 +177,32 @@ struct LimitedRunListView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(movie.name)
                                 .font(.headline)
-                            Text("Showings: \(movie.showtimeCount)")
+                            Text("Showings Remaining: \(movie.showtimeCount)")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                             if let next = movie.nextShowing {
-                                Text("Next: \(Self.displayFormatter.string(from: next))")
+                                Text("Next Showing: \(Self.displayFormatter.string(from: next))")
                                     .font(.subheadline)
-                                    .foregroundColor(.primary)
+                                    .foregroundColor(.secondary)
+                            }
+                            // theatre availability
+                            let selCount = settings.selectedIds.count
+                            let mvCount = movie.theatreIds.count
+                            if mvCount == selCount {
+                                Text("Playing at all selected theatres")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("Playing at \(mvCount) of \(selCount) theatres")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
                         }
                     }
                 }
             }
         }
-        .onAppear {
-            vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))
-        }
-        .onChange(of: settings.selectedIds) {
+        .task(id: settings.selectedIds) {
             vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))
         }
     }
