@@ -2,7 +2,7 @@
 //  AMCAPI.swift
 //  ReelTracker
 //
-//  Updated on 5/3/25 to decode latitude/longitude and support postal-code filtering
+//  Updated on 5/9/25 to include thumbnail URL decoding
 //
 import Foundation
 
@@ -25,6 +25,15 @@ public struct MediaContainer: Codable {
     public let posterDynamic: String?
     public let heroDesktopDynamic: String?
     public let trailerTeaserDynamic: String?
+    /// Small thumbnail variant for list display
+    public let posterDynamic180X74: String?
+
+    enum CodingKeys: String, CodingKey {
+        case posterDynamic
+        case heroDesktopDynamic
+        case trailerTeaserDynamic
+        case posterDynamic180X74 = "posterDynamic180X74"
+    }
 }
 
 public struct Movie: Identifiable, Codable {
@@ -48,7 +57,6 @@ public struct Showtime: Identifiable, Codable {
     public let purchaseUrl: String
 }
 
-/// Location info including coordinates for distance filtering
 public struct Location: Codable {
     public let latitude: Double?
     public let longitude: Double?
@@ -183,7 +191,6 @@ public class AMCAPIClient {
 
     // MARK: - Theatres
 
-    /// Fetch all theatres, optionally filtered by postal code
     public func fetchTheatres(pageNumber: Int = 1,
                               pageSize: Int = 20,
                               postalCode: String? = nil,
