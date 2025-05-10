@@ -2,8 +2,8 @@
 //  ContentView.swift
 //  ReelTracker
 //
-//  Updated on 5/6/25 to remove bottom tab bar
-//
+//  Updated on 5/9/25 to use default (primary) colors for text and icons
+
 import SwiftUI
 
 struct ContentView: View {
@@ -20,6 +20,7 @@ struct ContentView: View {
                             showSettings.toggle()
                         } label: {
                             Image(systemName: "gearshape")
+                                .foregroundColor(.primary)  // default black/white  [oai_citation:0‡ContentView.swift.txt](file-service://file-FBp5UVKcuz6nQEysRMJZgB)
                         }
                     }
                 }
@@ -28,6 +29,7 @@ struct ContentView: View {
                         .environmentObject(settings)
                 }
         }
+        .accentColor(.primary)  // ensure default coloring for any tinted elements
     }
 }
 

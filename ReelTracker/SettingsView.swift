@@ -2,8 +2,7 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 5/6/25 to persist ZIP code and selected theatre IDs
-//
+//  Updated on 5/9/25 to fix deprecated onChange signatures for iOS 17
 
 import SwiftUI
 import CoreLocation
@@ -19,26 +18,32 @@ struct TheatreLocation: Identifiable {
 
 final class SettingsViewModel: ObservableObject {
     // MARK: – UserDefaults keys
-    private let zipCodeKey = "zipCode"
-    private let selectedIdsKey = "selectedTheatreIds"
+    private let zipCodeKey               = "zipCode"
+    private let selectedIdsKey           = "selectedTheatreIds"
+    private let selectedReleaseTypesKey  = "selectedReleaseTypes"
+    private let distanceKey              = "searchDistance"
 
     // MARK: – Published properties with persistence
     @Published var zipCode: String {
+        didSet { UserDefaults.standard.set(zipCode, forKey: zipCodeKey) }
+    }
+    @Published var selectedIds: Set<Int> {
+        didSet { UserDefaults.standard.set(Array(selectedIds), forKey: selectedIdsKey) }
+    }
+    @Published var selectedReleaseTypes: Set<ReleaseType> {
         didSet {
-            UserDefaults.standard.set(zipCode, forKey: zipCodeKey)
+            let raw = selectedReleaseTypes.map(\.rawValue)
+            UserDefaults.standard.set(raw, forKey: selectedReleaseTypesKey)
         }
     }
-
-    @Published var selectedIds: Set<Int> {
-        didSet {
-            UserDefaults.standard.set(Array(selectedIds), forKey: selectedIdsKey)
-        }
+    @Published var searchDistance: Double {
+        didSet { UserDefaults.standard.set(searchDistance, forKey: distanceKey) }
     }
 
     @Published var isLoading: Bool = false
     @Published var theatres: [TheatreLocation] = []
 
-    private let geocoder = CLGeocoder()
+    private let geocoder      = CLGeocoder()
     private var userLocation: CLLocation?
 
     /// Only the selected theatres
@@ -47,31 +52,33 @@ final class SettingsViewModel: ObservableObject {
     }
 
     init() {
-        // Load saved ZIP (or default to empty)
         self.zipCode = UserDefaults.standard.string(forKey: zipCodeKey) ?? ""
-        // Load saved theatre IDs (or default to empty set)
         if let saved = UserDefaults.standard.array(forKey: selectedIdsKey) as? [Int] {
             self.selectedIds = Set(saved)
         } else {
             self.selectedIds = []
         }
+        if let saved = UserDefaults.standard.array(forKey: selectedReleaseTypesKey) as? [String] {
+            let types = Set(saved.compactMap { ReleaseType(rawValue: $0) })
+            self.selectedReleaseTypes = types.isEmpty ? Set(ReleaseType.allCases) : types
+        } else {
+            self.selectedReleaseTypes = Set(ReleaseType.allCases)
+        }
+        let savedDist = UserDefaults.standard.double(forKey: distanceKey)
+        self.searchDistance = savedDist > 0 ? savedDist : 50
 
-        // If we already have a valid ZIP, perform the lookup immediately
         if zipCode.count == 5 {
             lookupTheatres()
         }
     }
 
-    /// 1) Geocode the ZIP -> userLocation
-    /// 2) Fetch via postal-code filter
-    /// 3) Filter to ≤ 50 miles and compute distance
+    /// Perform theatre lookup with current ZIP and searchDistance
     func lookupTheatres() {
         guard zipCode.count == 5, Int(zipCode) != nil else { return }
         isLoading = true
         theatres = []
 
-        // Geocode ZIP to lat/lon
-        geocoder.geocodeAddressString(zipCode) { placemarks, error in
+        geocoder.geocodeAddressString(zipCode) { placemarks, _ in
             guard let loc = placemarks?.first?.location else {
                 DispatchQueue.main.async {
                     self.isLoading = false
@@ -81,7 +88,6 @@ final class SettingsViewModel: ObservableObject {
             }
             self.userLocation = loc
 
-            // Fetch theatres with postal-code filter
             AMCAPIClient.shared.fetchTheatres(
                 pageNumber: 1,
                 pageSize: 1000,
@@ -91,19 +97,15 @@ final class SettingsViewModel: ObservableObject {
                     self.isLoading = false
                     switch result {
                     case .success(let resp):
-                        guard let userLoc = self.userLocation else {
-                            self.theatres = []
-                            return
-                        }
-                        // Map and filter by distance
                         let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
                             guard
                                 let lat = th.location?.latitude,
                                 let lon = th.location?.longitude
                             else { return nil }
-                            let theatreLoc = CLLocation(latitude: lat, longitude: lon)
-                            let miles = theatreLoc.distance(from: userLoc) / 1609.34
-                            guard miles <= 50 else { return nil }
+                            let miles = loc.distance(
+                                from: CLLocation(latitude: lat, longitude: lon)
+                            ) / 1609.34
+                            guard miles <= self.searchDistance else { return nil }
                             return TheatreLocation(
                                 id: th.id,
                                 name: th.name,
@@ -113,9 +115,7 @@ final class SettingsViewModel: ObservableObject {
                             )
                         }
                         self.theatres = nearby.sorted { $0.distance < $1.distance }
-
-                    case .failure(let error):
-                        print("Error fetching theatres: \(error)")
+                    case .failure:
                         self.theatres = []
                     }
                 }
@@ -135,33 +135,83 @@ final class SettingsViewModel: ObservableObject {
 
 struct SettingsView: View {
     @EnvironmentObject var settings: SettingsViewModel
+    @FocusState private var zipFieldFocused: Bool
+    @State private var zipSearchWorkItem: DispatchWorkItem?
 
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("Enter ZIP Code")) {
-                    TextField("ZIP Code", text: $settings.zipCode)
-                        .keyboardType(.numberPad)
-                    Button("Search Theatres") {
-                        settings.lookupTheatres()
+                // Filters
+                Section(header: Text("Filters")) {
+                    ForEach(ReleaseType.allCases, id: \.self) { type in
+                        Toggle(type.rawValue, isOn: Binding(
+                            get:  { settings.selectedReleaseTypes.contains(type) },
+                            set: { newValue in
+                                if newValue {
+                                    settings.selectedReleaseTypes.insert(type)
+                                } else {
+                                    settings.selectedReleaseTypes.remove(type)
+                                }
+                            }
+                        ))
+                        .tint(.primary)
                     }
-                    .disabled(!(settings.zipCode.count == 5 && Int(settings.zipCode) != nil))
                 }
 
-                Section(header: Text("Theatres within 50 miles")) {
+                // ZIP + Search + Distance slider
+                Section(header: Text("Search Area")) {
+                    HStack {
+                        TextField("ZIP Code", text: $settings.zipCode)
+                            .keyboardType(.numberPad)
+                            .focused($zipFieldFocused)
+
+                        if !settings.zipCode.isEmpty {
+                            Button {
+                                zipFieldFocused = false
+                                settings.lookupTheatres()
+                            } label: {
+                                Image(systemName: "magnifyingglass.circle.fill")
+                                    .imageScale(.large)
+                                    .foregroundColor(.primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    HStack {
+                        Text("Distance: \(Int(settings.searchDistance)) mi")
+                        Slider(
+                            value: $settings.searchDistance,
+                            in: 1...100,
+                            step: 1
+                        )
+                        .tint(.primary)
+                        .onChange(of: settings.searchDistance) { oldValue, newValue in
+                            if settings.zipCode.count == 5 {
+                                settings.lookupTheatres()
+                            }
+                        }
+                    }
+                }
+
+                // Theatres list
+                Section(header: Text("Theatres within \(Int(settings.searchDistance)) miles")) {
                     if settings.isLoading {
-                        ProgressView("Loading…")
+                        ProgressView()
                     } else if settings.theatres.isEmpty {
-                        Text("No theatres found within 50 miles of ZIP \(settings.zipCode).")
+                        Text("No theatres found.")
                             .foregroundColor(.secondary)
                     } else {
                         ForEach(settings.theatres) { theatre in
                             Button {
                                 settings.toggleSelection(theatre)
                             } label: {
-                                HStack(alignment: .top) {
-                                    Image(systemName: settings.selectedIds.contains(theatre.id)
-                                          ? "checkmark.circle.fill" : "circle")
+                                HStack {
+                                    Image(systemName:
+                                        settings.selectedIds.contains(theatre.id)
+                                            ? "checkmark.circle.fill"
+                                            : "circle"
+                                    )
                                     VStack(alignment: .leading) {
                                         Text(theatre.name)
                                         if let pc = theatre.postalCode {
@@ -180,15 +230,37 @@ struct SettingsView: View {
                     }
                 }
 
+                // Selected summary
                 if !settings.selectedTheatres.isEmpty {
                     Section(header: Text("Selected Theatres")) {
-                        ForEach(settings.selectedTheatres) { t in
-                            Text(t.name)
+                        ForEach(settings.selectedTheatres) {
+                            Text($0.name)
                         }
                     }
                 }
             }
+            .accentColor(.primary)
             .navigationTitle("Settings")
+            .onTapGesture {
+                zipFieldFocused = false
+            }
+            .onChange(of: zipFieldFocused) { oldValue, focused in
+                if !focused,
+                   settings.zipCode.count == 5,
+                   Int(settings.zipCode) != nil {
+                    settings.lookupTheatres()
+                }
+            }
+            .onChange(of: settings.zipCode) { oldValue, newValue in
+                zipSearchWorkItem?.cancel()
+                let task = DispatchWorkItem {
+                    if newValue.count == 5, Int(newValue) != nil {
+                        settings.lookupTheatres()
+                    }
+                }
+                zipSearchWorkItem = task
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: task)
+            }
         }
     }
 }
