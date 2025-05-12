@@ -2,7 +2,8 @@
 //  LimitedRunListView.swift
 //  ReelTracker
 //
-//  Updated on 5/9/25 to move filtering into Settings and clean up the main view.
+//  Updated on 2025-05-12 to implement natural “Finder”-style alphabetical sorting
+//
 
 import SwiftUI
 import UIKit
@@ -15,7 +16,7 @@ enum ReleaseType: String, CaseIterable {
     case trueLimitedRun   = "Limited Run"
 }
 
-/// Model for a limited‐run movie item
+/// Model for a limited-run movie item
 struct LimitedMovie: Identifiable {
     let id: Int
     let name: String
@@ -28,7 +29,7 @@ struct LimitedMovie: Identifiable {
     let releaseType: ReleaseType
 }
 
-/// ViewModel for fetching, filtering, and classifying limited‐run movies
+/// ViewModel for fetching, filtering, and classifying limited-run movies
 final class LimitedRunViewModel: ObservableObject {
     @Published var limitedMovies: [LimitedMovie] = []
     @Published var isLoading: Bool = false
@@ -107,6 +108,7 @@ final class LimitedRunViewModel: ObservableObject {
             // 3) Fetch movie details
             let movieGroup = DispatchGroup()
             var movies: [Movie] = []
+
             for mid in counts.keys {
                 movieGroup.enter()
                 AMCAPIClient.shared.fetchMoviesByIds(ids: [mid]) { result in
@@ -144,11 +146,9 @@ final class LimitedRunViewModel: ObservableObject {
                         releaseType = .live
                     } else if isSensory {
                         releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease,
-                              age > 14 && count <= self.threshold {
+                    } else if let age = daysSinceRelease, age > 14 && count <= self.threshold {
                         releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease,
-                              age <= 14 && count < self.threshold {
+                    } else if let age = daysSinceRelease, age <= 14 && count < self.threshold {
                         releaseType = .trueLimitedRun
                     } else {
                         return nil
@@ -168,13 +168,13 @@ final class LimitedRunViewModel: ObservableObject {
                         nextShowing: next,
                         nextShowingUrl: url,
                         posterUrl: posterUrl,
-                        limitedRun: releaseType == .trueLimitedRun,
+                        limitedRun: count < self.threshold,
                         theatreIds: theatres,
                         releaseType: releaseType
                     )
                 }
 
-                // sort by next showing date
+                // Initially sort by next showing date
                 self.limitedMovies = classified.sorted {
                     let a = $0.nextShowing ?? Date.distantFuture
                     let b = $1.nextShowing ?? Date.distantFuture
@@ -186,19 +186,9 @@ final class LimitedRunViewModel: ObservableObject {
     }
 }
 
-/// SwiftUI view displaying limited‐run movies (filtering now lives in Settings)
 struct LimitedRunListView: View {
     @EnvironmentObject var settings: SettingsViewModel
     @StateObject private var vm = LimitedRunViewModel()
-
-    /// Apply the user’s selected release‐type filters (default = all)
-    private var filteredMovies: [LimitedMovie] {
-        let filters = settings.selectedReleaseTypes
-        if filters.count == ReleaseType.allCases.count {
-            return vm.limitedMovies
-        }
-        return vm.limitedMovies.filter { filters.contains($0.releaseType) }
-    }
 
     /// Formatter for “Next Showing”
     private static let displayFormatter: DateFormatter = {
@@ -209,6 +199,34 @@ struct LimitedRunListView: View {
         return f
     }()
 
+    /// Combine filtering and sorting based on Settings
+    private var sortedAndFiltered: [LimitedMovie] {
+        // 1) filter by release types
+        let filtered: [LimitedMovie]
+        let filters = settings.selectedReleaseTypes
+        if filters.count == ReleaseType.allCases.count {
+            filtered = vm.limitedMovies
+        } else {
+            filtered = vm.limitedMovies.filter { filters.contains($0.releaseType) }
+        }
+
+        // 2) sort according to user choice
+        switch settings.sortOption {
+        case .alphabetical:
+            return filtered.sorted {
+                $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+        case .remainingShowings:
+            return filtered.sorted { $0.showtimeCount > $1.showtimeCount }
+        case .nextShowingDate:
+            return filtered.sorted {
+                let a = $0.nextShowing ?? Date.distantFuture
+                let b = $1.nextShowing ?? Date.distantFuture
+                return a < b
+            }
+        }
+    }
+
     var body: some View {
         Group {
             if settings.selectedIds.isEmpty {
@@ -216,8 +234,11 @@ struct LimitedRunListView: View {
                     .foregroundColor(.secondary)
             } else if vm.isLoading {
                 ProgressView("Loading…")
+            } else if sortedAndFiltered.isEmpty {
+                Text("No movies found for the selected filters.")
+                    .foregroundColor(.secondary)
             } else {
-                List(filteredMovies) { movie in
+                List(sortedAndFiltered) { movie in
                     HStack(alignment: .top) {
                         CachedAsyncImage(
                             urlString: movie.posterUrl,
@@ -294,20 +315,18 @@ struct CachedAsyncImage: View {
             ProgressView()
                 .frame(width: width, height: height)
                 .onAppear { loadImage() }
+
         case .success(let img):
             Image(uiImage: img)
                 .resizable()
                 .scaledToFit()
                 .frame(width: width, height: height)
+
         case .failure:
-            VStack {
-                Image(systemName: "photo")
-                Button("Retry") {
-                    retryCount += 1
-                    loadImage()
-                }
-            }
-            .frame(width: width, height: height)
+            Image(systemName: "photo")
+                .resizable()             // make it fill the frame
+                .scaledToFit()           // maintain aspect ratio
+                .frame(width: width, height: height)
         }
     }
 
@@ -316,11 +335,13 @@ struct CachedAsyncImage: View {
             state = .failure
             return
         }
+
         if let data = DataCache.shared.data(forKey: url.absoluteString),
            let img = UIImage(data: data) {
             state = .success(img)
             return
         }
+
         URLSession.shared.dataTask(with: url) { data, _, _ in
             if let d = data, let img = UIImage(data: d) {
                 DataCache.shared.store(d, forKey: url.absoluteString)

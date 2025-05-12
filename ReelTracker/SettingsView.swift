@@ -2,11 +2,21 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-11 to add cancellation for in-flight lookups
+//  Updated on 2025-05-11 to add cancellation for in-flight lookups and Sort By option
 //
 
 import SwiftUI
 import CoreLocation
+
+// ────────────────────────────────────────────────
+// Sort options for how the movie list is ordered
+enum SortOption: String, CaseIterable, Identifiable {
+    case alphabetical      = "A → Z"
+    case remainingShowings = "Showings Remaining"
+    case nextShowingDate   = "Next Showing"
+    var id: Self { self }
+}
+// ────────────────────────────────────────────────
 
 /// Local model for display, including distance from user
 struct TheatreLocation: Identifiable {
@@ -23,6 +33,7 @@ final class SettingsViewModel: ObservableObject {
     private let selectedIdsKey          = "selectedTheatreIds"
     private let selectedReleaseTypesKey = "selectedReleaseTypes"
     private let distanceKey             = "searchDistance"
+    private let sortOptionKey           = "sortOption"      // New key
 
     // MARK: – Published properties with persistence
     @Published var zipCode: String {
@@ -39,6 +50,9 @@ final class SettingsViewModel: ObservableObject {
     }
     @Published var searchDistance: Double {
         didSet { UserDefaults.standard.set(searchDistance, forKey: distanceKey) }
+    }
+    @Published var sortOption: SortOption {                     // New property
+        didSet { UserDefaults.standard.set(sortOption.rawValue, forKey: sortOptionKey) }
     }
 
     @Published var isLoading: Bool = false
@@ -70,6 +84,14 @@ final class SettingsViewModel: ObservableObject {
         }
         let savedDist = UserDefaults.standard.double(forKey: distanceKey)
         self.searchDistance = savedDist > 0 ? savedDist : 50
+
+        // Load persisted sort option (default to nextShowingDate)
+        if let raw = UserDefaults.standard.string(forKey: sortOptionKey),
+           let opt = SortOption(rawValue: raw) {
+            self.sortOption = opt
+        } else {
+            self.sortOption = .nextShowingDate
+        }
 
         // Initial lookup if ZIP was already valid
         if zipCode.count == 5, Int(zipCode) != nil {
@@ -195,7 +217,17 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
-                // Filters
+                // ── Sort By ─────────────────────────
+                Section(header: Text("Sort By")) {
+                    Picker("Sort By", selection: $settings.sortOption) {
+                        ForEach(SortOption.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                // ── Filters ─────────────────────────
                 Section(header: Text("Filters")) {
                     ForEach(ReleaseType.allCases, id: \.self) { type in
                         Toggle(type.rawValue, isOn: Binding(
@@ -212,7 +244,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // ZIP + Search + Distance slider
+                // ── ZIP + Search + Distance ──────────
                 Section(header: Text("Search Area")) {
                     HStack {
                         TextField("ZIP Code", text: $settings.zipCode)
@@ -248,7 +280,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Theatres list
+                // ── Theatres List ─────────────────────
                 Section(header: Text("Theatres within \(Int(settings.searchDistance)) miles")) {
                     if settings.isLoading {
                         ProgressView()
@@ -284,7 +316,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Selected summary
+                // ── Selected Theatres Summary ────────
                 if !settings.selectedTheatres.isEmpty {
                     Section(header: Text("Selected Theatres")) {
                         ForEach(settings.selectedTheatres) {
