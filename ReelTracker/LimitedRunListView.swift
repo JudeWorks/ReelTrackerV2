@@ -2,7 +2,7 @@
 //  LimitedRunListView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-12 to implement natural “Finder”-style alphabetical sorting
+//  Updated on 2025-05-12 to dynamically support hiding and unhiding movies
 //
 
 import SwiftUI
@@ -35,14 +35,12 @@ final class LimitedRunViewModel: ObservableObject {
     @Published var isLoading: Bool = false
 
     private let threshold = 10
-
     private let localFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         f.timeZone = .current
         return f
     }()
-
     private let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
@@ -60,7 +58,7 @@ final class LimitedRunViewModel: ObservableObject {
         var allTagged: [(theatreId: Int, showtime: Showtime)] = []
         let showtimeGroup = DispatchGroup()
 
-        // 1) Fetch showtimes
+        // 1) Fetch showtimes for each theatre
         for theatreId in theatreIds {
             showtimeGroup.enter()
             AMCAPIClient.shared.fetchShowtimes(
@@ -79,7 +77,7 @@ final class LimitedRunViewModel: ObservableObject {
             }
         }
 
-        // 2) Aggregate and determine next showtime
+        // 2) Aggregate counts and next showtime
         showtimeGroup.notify(queue: .main) {
             let now = Date()
             var counts: [Int: Int] = [:]
@@ -127,12 +125,8 @@ final class LimitedRunViewModel: ObservableObject {
                     let url = nextUrls[m.id] ?? ""
                     let theatres = movieToTheatres[m.id] ?? []
 
-                    let isLive = m.attributes?.contains {
-                        $0.code.lowercased().contains("live")
-                    } ?? false
-                    let isSensory = m.attributes?.contains {
-                        $0.code.lowercased().contains("sensory")
-                    } ?? false
+                    let isLive = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
+                    let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
 
                     let daysSinceRelease: Int? = {
                         guard let rdStr = m.releaseDateUtc,
@@ -176,8 +170,8 @@ final class LimitedRunViewModel: ObservableObject {
 
                 // Initially sort by next showing date
                 self.limitedMovies = classified.sorted {
-                    let a = $0.nextShowing ?? Date.distantFuture
-                    let b = $1.nextShowing ?? Date.distantFuture
+                    let a = $0.nextShowing ?? .distantFuture
+                    let b = $1.nextShowing ?? .distantFuture
                     return a < b
                 }
                 self.isLoading = false
@@ -188,6 +182,7 @@ final class LimitedRunViewModel: ObservableObject {
 
 struct LimitedRunListView: View {
     @EnvironmentObject var settings: SettingsViewModel
+    @EnvironmentObject var userData: UserDataStore
     @StateObject private var vm = LimitedRunViewModel()
 
     /// Formatter for “Next Showing”
@@ -199,29 +194,30 @@ struct LimitedRunListView: View {
         return f
     }()
 
-    /// Combine filtering and sorting based on Settings
+    /// Apply visibility and release-type filters, then sorting
     private var sortedAndFiltered: [LimitedMovie] {
-        // 1) filter by release types
-        let filtered: [LimitedMovie]
-        let filters = settings.selectedReleaseTypes
-        if filters.count == ReleaseType.allCases.count {
-            filtered = vm.limitedMovies
-        } else {
-            filtered = vm.limitedMovies.filter { filters.contains($0.releaseType) }
+        // 1) Include non-hidden movies only if their release-type toggle is on,
+        //    and include hidden movies only if “Hidden” toggle is on.
+        let visible = vm.limitedMovies.filter { movie in
+            if userData.isHidden(movie: movie.id) {
+                return settings.showHiddenMovies
+            } else {
+                return settings.selectedReleaseTypes.contains(movie.releaseType)
+            }
         }
 
-        // 2) sort according to user choice
+        // 2) Sort according to user choice
         switch settings.sortOption {
         case .alphabetical:
-            return filtered.sorted {
+            return visible.sorted {
                 $0.name.localizedStandardCompare($1.name) == .orderedAscending
             }
         case .remainingShowings:
-            return filtered.sorted { $0.showtimeCount > $1.showtimeCount }
+            return visible.sorted { $0.showtimeCount > $1.showtimeCount }
         case .nextShowingDate:
-            return filtered.sorted {
-                let a = $0.nextShowing ?? Date.distantFuture
-                let b = $1.nextShowing ?? Date.distantFuture
+            return visible.sorted {
+                let a = $0.nextShowing ?? .distantFuture
+                let b = $1.nextShowing ?? .distantFuture
                 return a < b
             }
         }
@@ -260,16 +256,29 @@ struct LimitedRunListView: View {
                                 .font(.caption)
                                 .foregroundColor(.primary)
 
-                            let selCount = settings.selectedIds.count
-                            let mvCount = movie.theatreIds.count
-                            if mvCount == selCount {
-                                Text("Playing at all selected theatres")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                Text("Playing at \(mvCount) of \(selCount) theatres")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
+                            let total = settings.selectedIds.count
+                            let playing = movie.theatreIds.count
+                            Text(
+                                playing == total
+                                    ? "Playing at all selected theatres"
+                                    : "Playing at \(playing) of \(total) theatres"
+                            )
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        }
+                    }
+                    .swipeActions(edge: .trailing) {
+                        if userData.isHidden(movie: movie.id) {
+                            Button {
+                                userData.unhide(movie: movie.id)
+                            } label: {
+                                Label("Unhide", systemImage: "eye")
+                            }
+                        } else {
+                            Button(role: .destructive) {
+                                userData.hide(movie: movie.id)
+                            } label: {
+                                Label("Hide", systemImage: "eye.slash")
                             }
                         }
                     }
@@ -294,9 +303,7 @@ struct CachedAsyncImage: View {
     let height: CGFloat
 
     private enum LoadState {
-        case loading
-        case success(UIImage)
-        case failure
+        case loading, success(UIImage), failure
     }
 
     @State private var state: LoadState = .loading
@@ -324,8 +331,8 @@ struct CachedAsyncImage: View {
 
         case .failure:
             Image(systemName: "photo")
-                .resizable()             // make it fill the frame
-                .scaledToFit()           // maintain aspect ratio
+                .resizable()
+                .scaledToFit()
                 .frame(width: width, height: height)
         }
     }
@@ -359,5 +366,6 @@ struct LimitedRunListView_Previews: PreviewProvider {
     static var previews: some View {
         LimitedRunListView()
             .environmentObject(SettingsViewModel())
+            .environmentObject(UserDataStore.shared)
     }
 }

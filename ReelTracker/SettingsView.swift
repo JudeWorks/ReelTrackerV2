@@ -2,7 +2,7 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-11 to add cancellation for in-flight lookups and Sort By option
+//  Updated on 2025-05-12 to fix theatre row tappability
 //
 
 import SwiftUI
@@ -33,7 +33,8 @@ final class SettingsViewModel: ObservableObject {
     private let selectedIdsKey          = "selectedTheatreIds"
     private let selectedReleaseTypesKey = "selectedReleaseTypes"
     private let distanceKey             = "searchDistance"
-    private let sortOptionKey           = "sortOption"      // New key
+    private let sortOptionKey           = "sortOption"
+    private let showHiddenKey           = "showHiddenMovies"
 
     // MARK: – Published properties with persistence
     @Published var zipCode: String {
@@ -51,8 +52,11 @@ final class SettingsViewModel: ObservableObject {
     @Published var searchDistance: Double {
         didSet { UserDefaults.standard.set(searchDistance, forKey: distanceKey) }
     }
-    @Published var sortOption: SortOption {                     // New property
+    @Published var sortOption: SortOption {
         didSet { UserDefaults.standard.set(sortOption.rawValue, forKey: sortOptionKey) }
+    }
+    @Published var showHiddenMovies: Bool {
+        didSet { UserDefaults.standard.set(showHiddenMovies, forKey: showHiddenKey) }
     }
 
     @Published var isLoading: Bool = false
@@ -85,7 +89,7 @@ final class SettingsViewModel: ObservableObject {
         let savedDist = UserDefaults.standard.double(forKey: distanceKey)
         self.searchDistance = savedDist > 0 ? savedDist : 50
 
-        // Load persisted sort option (default to nextShowingDate)
+        // Load persisted sort option
         if let raw = UserDefaults.standard.string(forKey: sortOptionKey),
            let opt = SortOption(rawValue: raw) {
             self.sortOption = opt
@@ -93,7 +97,10 @@ final class SettingsViewModel: ObservableObject {
             self.sortOption = .nextShowingDate
         }
 
-        // Initial lookup if ZIP was already valid
+        // Load persisted “show hidden” flag
+        self.showHiddenMovies = UserDefaults.standard.bool(forKey: showHiddenKey)
+
+        // Initial lookup if ZIP already valid
         if zipCode.count == 5, Int(zipCode) != nil {
             lookupTheatres()
         }
@@ -107,13 +114,9 @@ final class SettingsViewModel: ObservableObject {
 
     /// Perform theatre lookup with current ZIP and searchDistance, cancellable
     func lookupTheatres() {
-        // Cancel previous work
         cancelLookup()
-
-        // Only proceed if ZIP looks valid
         guard zipCode.count == 5, Int(zipCode) != nil else { return }
 
-        // Kick off a new Task
         lookupTask = Task { [weak self] in
             guard let self = self else { return }
             await MainActor.run {
@@ -126,15 +129,11 @@ final class SettingsViewModel: ObservableObject {
             do {
                 placemarks = try await withCheckedThrowingContinuation { cont in
                     self.geocoder.geocodeAddressString(self.zipCode) { marks, error in
-                        if let error = error {
-                            cont.resume(throwing: error)
-                        } else {
-                            cont.resume(returning: marks ?? [])
-                        }
+                        if let error = error { cont.resume(throwing: error) }
+                        else { cont.resume(returning: marks ?? []) }
                     }
                 }
             } catch {
-                // Geocode failed (or Task was cancelled)
                 if Task.isCancelled { return }
                 await MainActor.run {
                     self.isLoading = false
@@ -167,19 +166,20 @@ final class SettingsViewModel: ObservableObject {
 
                 // 3) Filter by distance
                 let nearby = response._embedded.theatres.compactMap { th -> TheatreLocation? in
-                    guard
-                        let lat = th.location?.latitude,
-                        let lon = th.location?.longitude
-                    else { return nil }
-                    let miles = location
-                        .distance(from: CLLocation(latitude: lat, longitude: lon))
-                        / 1609.34
+                    guard let lat = th.location?.latitude,
+                          let lon = th.location?.longitude else { return nil }
+                    let miles = location.distance(
+                        from: CLLocation(latitude: lat, longitude: lon)
+                    ) / 1609.34
                     guard miles <= self.searchDistance else { return nil }
                     return TheatreLocation(
                         id: th.id,
                         name: th.name,
                         postalCode: th.location?.postalCode,
-                        coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                        coordinate: CLLocationCoordinate2D(
+                            latitude: lat,
+                            longitude: lon
+                        ),
                         distance: miles
                     )
                 }.sorted { $0.distance < $1.distance }
@@ -189,7 +189,6 @@ final class SettingsViewModel: ObservableObject {
                     self.isLoading = false
                 }
             } catch {
-                // API fetch failed
                 if Task.isCancelled { return }
                 await MainActor.run {
                     self.theatres = []
@@ -242,9 +241,11 @@ struct SettingsView: View {
                         ))
                         .tint(.primary)
                     }
+                    Toggle("Hidden", isOn: $settings.showHiddenMovies)
+                        .tint(.primary)
                 }
 
-                // ── ZIP + Search + Distance ──────────
+                // ── Search Area ─────────────────────────
                 Section(header: Text("Search Area")) {
                     HStack {
                         TextField("ZIP Code", text: $settings.zipCode)
@@ -261,6 +262,15 @@ struct SettingsView: View {
                                     .foregroundColor(.primary)
                             }
                             .buttonStyle(.plain)
+                        }
+                    }
+                    .toolbar {
+                        // Adds a "Done" button above the number pad
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button("Done") {
+                                zipFieldFocused = false
+                            }
                         }
                     }
 
@@ -309,7 +319,9 @@ struct SettingsView: View {
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
                                     }
+                                    Spacer()
                                 }
+                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
@@ -327,9 +339,6 @@ struct SettingsView: View {
             }
             .accentColor(.primary)
             .navigationTitle("Settings")
-            .onTapGesture {
-                zipFieldFocused = false
-            }
             .onChange(of: zipFieldFocused) { _, focused in
                 if !focused,
                    settings.zipCode.count == 5,
