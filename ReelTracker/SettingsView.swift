@@ -2,7 +2,8 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 5/9/25 to fix deprecated onChange signatures for iOS 17
+//  Updated on 2025-05-11 to add cancellation for in-flight lookups
+//
 
 import SwiftUI
 import CoreLocation
@@ -18,10 +19,10 @@ struct TheatreLocation: Identifiable {
 
 final class SettingsViewModel: ObservableObject {
     // MARK: – UserDefaults keys
-    private let zipCodeKey               = "zipCode"
-    private let selectedIdsKey           = "selectedTheatreIds"
-    private let selectedReleaseTypesKey  = "selectedReleaseTypes"
-    private let distanceKey              = "searchDistance"
+    private let zipCodeKey              = "zipCode"
+    private let selectedIdsKey          = "selectedTheatreIds"
+    private let selectedReleaseTypesKey = "selectedReleaseTypes"
+    private let distanceKey             = "searchDistance"
 
     // MARK: – Published properties with persistence
     @Published var zipCode: String {
@@ -43,15 +44,18 @@ final class SettingsViewModel: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var theatres: [TheatreLocation] = []
 
-    private let geocoder      = CLGeocoder()
-    private var userLocation: CLLocation?
-
     /// Only the selected theatres
     var selectedTheatres: [TheatreLocation] {
         theatres.filter { selectedIds.contains($0.id) }
     }
 
+    // MARK: – Internal state for lookup & cancellation
+    private let geocoder = CLGeocoder()
+    private var userLocation: CLLocation?
+    private var lookupTask: Task<Void, Never>?
+
     init() {
+        // Load persisted settings
         self.zipCode = UserDefaults.standard.string(forKey: zipCodeKey) ?? ""
         if let saved = UserDefaults.standard.array(forKey: selectedIdsKey) as? [Int] {
             self.selectedIds = Set(saved)
@@ -67,57 +71,107 @@ final class SettingsViewModel: ObservableObject {
         let savedDist = UserDefaults.standard.double(forKey: distanceKey)
         self.searchDistance = savedDist > 0 ? savedDist : 50
 
-        if zipCode.count == 5 {
+        // Initial lookup if ZIP was already valid
+        if zipCode.count == 5, Int(zipCode) != nil {
             lookupTheatres()
         }
     }
 
-    /// Perform theatre lookup with current ZIP and searchDistance
-    func lookupTheatres() {
-        guard zipCode.count == 5, Int(zipCode) != nil else { return }
-        isLoading = true
-        theatres = []
+    /// Cancel any in-flight geocode or network lookup
+    func cancelLookup() {
+        lookupTask?.cancel()
+        geocoder.cancelGeocode()
+    }
 
-        geocoder.geocodeAddressString(zipCode) { placemarks, _ in
-            guard let loc = placemarks?.first?.location else {
-                DispatchQueue.main.async {
+    /// Perform theatre lookup with current ZIP and searchDistance, cancellable
+    func lookupTheatres() {
+        // Cancel previous work
+        cancelLookup()
+
+        // Only proceed if ZIP looks valid
+        guard zipCode.count == 5, Int(zipCode) != nil else { return }
+
+        // Kick off a new Task
+        lookupTask = Task { [weak self] in
+            guard let self = self else { return }
+            await MainActor.run {
+                self.isLoading = true
+                self.theatres = []
+            }
+
+            // 1) Geocode ZIP
+            let placemarks: [CLPlacemark]
+            do {
+                placemarks = try await withCheckedThrowingContinuation { cont in
+                    self.geocoder.geocodeAddressString(self.zipCode) { marks, error in
+                        if let error = error {
+                            cont.resume(throwing: error)
+                        } else {
+                            cont.resume(returning: marks ?? [])
+                        }
+                    }
+                }
+            } catch {
+                // Geocode failed (or Task was cancelled)
+                if Task.isCancelled { return }
+                await MainActor.run {
                     self.isLoading = false
                     self.theatres = []
                 }
                 return
             }
-            self.userLocation = loc
-
-            AMCAPIClient.shared.fetchTheatres(
-                pageNumber: 1,
-                pageSize: 1000,
-                postalCode: self.zipCode
-            ) { result in
-                DispatchQueue.main.async {
+            if Task.isCancelled { return }
+            guard let location = placemarks.first?.location else {
+                await MainActor.run {
                     self.isLoading = false
-                    switch result {
-                    case .success(let resp):
-                        let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
-                            guard
-                                let lat = th.location?.latitude,
-                                let lon = th.location?.longitude
-                            else { return nil }
-                            let miles = loc.distance(
-                                from: CLLocation(latitude: lat, longitude: lon)
-                            ) / 1609.34
-                            guard miles <= self.searchDistance else { return nil }
-                            return TheatreLocation(
-                                id: th.id,
-                                name: th.name,
-                                postalCode: th.location?.postalCode,
-                                coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                                distance: miles
-                            )
-                        }
-                        self.theatres = nearby.sorted { $0.distance < $1.distance }
-                    case .failure:
-                        self.theatres = []
+                    self.theatres = []
+                }
+                return
+            }
+            self.userLocation = location
+
+            // 2) Fetch theatres from API
+            do {
+                let response = try await withCheckedThrowingContinuation { cont in
+                    AMCAPIClient.shared.fetchTheatres(
+                        pageNumber: 1,
+                        pageSize: 1000,
+                        postalCode: self.zipCode
+                    ) { result in
+                        cont.resume(with: result.mapError { $0 })
                     }
+                }
+                if Task.isCancelled { return }
+
+                // 3) Filter by distance
+                let nearby = response._embedded.theatres.compactMap { th -> TheatreLocation? in
+                    guard
+                        let lat = th.location?.latitude,
+                        let lon = th.location?.longitude
+                    else { return nil }
+                    let miles = location
+                        .distance(from: CLLocation(latitude: lat, longitude: lon))
+                        / 1609.34
+                    guard miles <= self.searchDistance else { return nil }
+                    return TheatreLocation(
+                        id: th.id,
+                        name: th.name,
+                        postalCode: th.location?.postalCode,
+                        coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                        distance: miles
+                    )
+                }.sorted { $0.distance < $1.distance }
+
+                await MainActor.run {
+                    self.theatres = nearby
+                    self.isLoading = false
+                }
+            } catch {
+                // API fetch failed
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.theatres = []
+                    self.isLoading = false
                 }
             }
         }
@@ -186,7 +240,7 @@ struct SettingsView: View {
                             step: 1
                         )
                         .tint(.primary)
-                        .onChange(of: settings.searchDistance) { oldValue, newValue in
+                        .onChange(of: settings.searchDistance) { _, _ in
                             if settings.zipCode.count == 5 {
                                 settings.lookupTheatres()
                             }
@@ -244,14 +298,14 @@ struct SettingsView: View {
             .onTapGesture {
                 zipFieldFocused = false
             }
-            .onChange(of: zipFieldFocused) { oldValue, focused in
+            .onChange(of: zipFieldFocused) { _, focused in
                 if !focused,
                    settings.zipCode.count == 5,
                    Int(settings.zipCode) != nil {
                     settings.lookupTheatres()
                 }
             }
-            .onChange(of: settings.zipCode) { oldValue, newValue in
+            .onChange(of: settings.zipCode) { _, newValue in
                 zipSearchWorkItem?.cancel()
                 let task = DispatchWorkItem {
                     if newValue.count == 5, Int(newValue) != nil {
@@ -262,12 +316,8 @@ struct SettingsView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: task)
             }
         }
-    }
-}
-
-struct SettingsView_Previews: PreviewProvider {
-    static var previews: some View {
-        SettingsView()
-            .environmentObject(SettingsViewModel())
+        .onDisappear {
+            settings.cancelLookup()
+        }
     }
 }
