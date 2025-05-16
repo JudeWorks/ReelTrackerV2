@@ -2,7 +2,7 @@
 //  AMCAPI.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-11 to remove force-unwraps on URL construction
+//  Updated on 2025-05-15 to include A-List eligibility, trailer support, and theatre amenities
 //
 
 import Foundation
@@ -19,31 +19,36 @@ public enum APIError: Error {
 
 // MARK: - Domain Models
 
+/// Attribute represents special formats or features for movies/theatres
 public struct Attribute: Codable {
     public let code: String
     public let name: String
     public let description: String?
 }
 
+/// Media assets available for a movie
 public struct MediaContainer: Codable {
     public let posterDynamic: String?
     public let heroDesktopDynamic: String?
-    public let trailerTeaserDynamic: String?
+    public let trailerTeaserDynamic: String? // URL for the movie trailer teaser
     public let posterDynamic180X74: String?
 }
 
+/// Movie model representing a film
 public struct Movie: Identifiable, Codable {
     public let id: Int
     public let name: String
     public let slug: String?
     public let synopsis: String?
-    public let runTime: Int?
-    public let mpaaRating: String?
+    public let runTime: Int? // Duration in minutes
+    public let mpaaRating: String? // e.g. "PG-13"
     public let releaseDateUtc: String?
-    public let attributes: [Attribute]?
+    public let attributes: [Attribute]? // e.g. formats like "3D", "IMAX"
     public let media: MediaContainer?
+    public let availableForAList: Bool? // AMC A‑List eligibility flag
 }
 
+/// Showtime information for a movie at a theatre
 public struct Showtime: Identifiable, Codable {
     public let id: Int
     public let theatreId: Int
@@ -53,17 +58,20 @@ public struct Showtime: Identifiable, Codable {
     public let purchaseUrl: String
 }
 
+/// Geographic location data
 public struct Location: Codable {
     public let latitude: Double?
     public let longitude: Double?
     public let postalCode: String?
 }
 
+/// Theatre model representing an AMC location
 public struct Theatre: Identifiable, Codable {
     public let id: Int
     public let name: String
     public let timeZone: String?
     public let location: Location?
+    public let attributes: [Attribute]? // Theatre amenities (e.g. "Dolby Cinema", "Recliners")
 }
 
 // MARK: - Pagination Wrappers
@@ -107,7 +115,6 @@ public class AMCAPIClient {
     private let jsonDecoder: JSONDecoder
 
     private init() {
-        // Safely unwrap the base URL
         guard let url = URL(string: "https://api.amctheatres.com/v2") else {
             preconditionFailure("Invalid base URL for AMC API")
         }
@@ -116,7 +123,7 @@ public class AMCAPIClient {
         self.jsonDecoder.keyDecodingStrategy = .convertFromSnakeCase
     }
 
-    /// Basic request executor
+    /// Basic request executor that injects the vendor key
     private func request<T: Decodable>(
         _ url: URL,
         completion: @escaping (Result<T, APIError>) -> Void
@@ -180,6 +187,7 @@ public class AMCAPIClient {
 
     // MARK: - Movies
 
+    /// Fetch movies playing in a date range (all pages)
     public func fetchMovies(
         startDate: String,
         endDate: String,
@@ -188,21 +196,16 @@ public class AMCAPIClient {
         completion: @escaping (Result<MoviesResponse, APIError>) -> Void
     ) {
         let endpoint = baseURL.appendingPathComponent("movies")
-        guard var comps = URLComponents(
-            url: endpoint,
-            resolvingAgainstBaseURL: false
-        ) else {
+        guard var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             completion(.failure(.invalidURL)); return
         }
         comps.queryItems = [
-            .init(name: "start-date",   value: startDate),
-            .init(name: "end-date",     value: endDate),
-            .init(name: "page-number",  value: "\(pageNumber)"),
-            .init(name: "page-size",    value: "\(pageSize)")
+            .init(name: "start-date", value: startDate),
+            .init(name: "end-date",   value: endDate),
+            .init(name: "page-number", value: "\(pageNumber)"),
+            .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else {
-            completion(.failure(.invalidURL)); return
-        }
+        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
 
         fetchAllPages(
             initialURL: initialURL,
@@ -221,6 +224,7 @@ public class AMCAPIClient {
         )
     }
 
+    /// Fetch advance-ticket (pre-release) movies in a date range
     public func fetchAdvanceTicketMovies(
         startDate: String,
         endDate: String,
@@ -229,21 +233,16 @@ public class AMCAPIClient {
         completion: @escaping (Result<MoviesResponse, APIError>) -> Void
     ) {
         let endpoint = baseURL.appendingPathComponent("movies/views/advance")
-        guard var comps = URLComponents(
-            url: endpoint,
-            resolvingAgainstBaseURL: false
-        ) else {
+        guard var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             completion(.failure(.invalidURL)); return
         }
         comps.queryItems = [
-            .init(name: "start-date",   value: startDate),
-            .init(name: "end-date",     value: endDate),
-            .init(name: "page-number",  value: "\(pageNumber)"),
-            .init(name: "page-size",    value: "\(pageSize)")
+            .init(name: "start-date", value: startDate),
+            .init(name: "end-date",   value: endDate),
+            .init(name: "page-number", value: "\(pageNumber)"),
+            .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else {
-            completion(.failure(.invalidURL)); return
-        }
+        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
 
         fetchAllPages(
             initialURL: initialURL,
@@ -262,6 +261,7 @@ public class AMCAPIClient {
         )
     }
 
+    /// Fetch movies by a list of IDs
     public func fetchMoviesByIds(
         ids: [Int],
         pageNumber: Int = 1,
@@ -269,20 +269,15 @@ public class AMCAPIClient {
         completion: @escaping (Result<MoviesResponse, APIError>) -> Void
     ) {
         let endpoint = baseURL.appendingPathComponent("movies")
-        guard var comps = URLComponents(
-            url: endpoint,
-            resolvingAgainstBaseURL: false
-        ) else {
+        guard var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             completion(.failure(.invalidURL)); return
         }
         comps.queryItems = [
-            .init(name: "ids",         value: ids.map(String.init).joined(separator: ",")),
+            .init(name: "ids", value: ids.map(String.init).joined(separator: ",")),
             .init(name: "page-number", value: "\(pageNumber)"),
             .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else {
-            completion(.failure(.invalidURL)); return
-        }
+        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
 
         fetchAllPages(
             initialURL: initialURL,
@@ -301,8 +296,18 @@ public class AMCAPIClient {
         )
     }
 
+    /// Fetch detailed info for a single movie by ID
+    public func fetchMovieDetails(
+        id: Int,
+        completion: @escaping (Result<Movie, APIError>) -> Void
+    ) {
+        let url = baseURL.appendingPathComponent("movies/\(id)")
+        request(url, completion: completion)
+    }
+
     // MARK: - Theatres
 
+    /// Fetch list of theatres (all pages), optional postal code filter
     public func fetchTheatres(
         pageNumber: Int = 1,
         pageSize: Int = 20,
@@ -310,10 +315,7 @@ public class AMCAPIClient {
         completion: @escaping (Result<TheatresResponse, APIError>) -> Void
     ) {
         let endpoint = baseURL.appendingPathComponent("theatres")
-        guard var comps = URLComponents(
-            url: endpoint,
-            resolvingAgainstBaseURL: false
-        ) else {
+        guard var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             completion(.failure(.invalidURL)); return
         }
         var items: [URLQueryItem] = [
@@ -324,10 +326,7 @@ public class AMCAPIClient {
             items.append(.init(name: "postal-code", value: postal))
         }
         comps.queryItems = items
-
-        guard let initialURL = comps.url else {
-            completion(.failure(.invalidURL)); return
-        }
+        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
 
         fetchAllPages(
             initialURL: initialURL,
@@ -346,6 +345,7 @@ public class AMCAPIClient {
         )
     }
 
+    /// Fetch detailed info for a single theatre by ID
     public func fetchTheatreDetails(
         id: Int,
         completion: @escaping (Result<Theatre, APIError>) -> Void
@@ -356,6 +356,7 @@ public class AMCAPIClient {
 
     // MARK: - Showtimes
 
+    /// Fetch showtimes for a theatre, optional movie filter and date
     public func fetchShowtimes(
         theatreId: Int,
         movieId: Int? = nil,
@@ -369,10 +370,7 @@ public class AMCAPIClient {
             path += "/\(date)"
         }
         let endpoint = baseURL.appendingPathComponent(path)
-        guard var comps = URLComponents(
-            url: endpoint,
-            resolvingAgainstBaseURL: false
-        ) else {
+        guard var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
             completion(.failure(.invalidURL)); return
         }
         var items: [URLQueryItem] = [
@@ -383,13 +381,10 @@ public class AMCAPIClient {
             items.append(.init(name: "movie-id", value: "\(mid)"))
         }
         comps.queryItems = items
-
-        guard let initialURL = comps.url else {
-            completion(.failure(.invalidURL)); return
-        }
+        guard let finalURL = comps.url else { completion(.failure(.invalidURL)); return }
 
         fetchAllPages(
-            initialURL: initialURL,
+            initialURL: finalURL,
             extractItems:   { $0._embedded.showtimes },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in

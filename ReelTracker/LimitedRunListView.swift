@@ -2,7 +2,7 @@
 //  LimitedRunListView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-12 to dynamically support hiding and unhiding movies
+//  Updated on 2025-05-16 to wire up AMC A-List filtering
 //
 
 import SwiftUI
@@ -26,6 +26,7 @@ struct LimitedMovie: Identifiable {
     let posterUrl: String
     let limitedRun: Bool
     let theatreIds: Set<Int>
+    let availableForAList: Bool       // ← new flag
     let releaseType: ReleaseType
 }
 
@@ -117,13 +118,16 @@ final class LimitedRunViewModel: ObservableObject {
                 }
             }
 
-            // 4) Classify each movie
+            // 4) Classify each movie, now including A-List flag
             movieGroup.notify(queue: .main) {
                 let classified: [LimitedMovie] = movies.compactMap { m in
                     let count = counts[m.id] ?? 0
                     let next = nextDates[m.id]
                     let url = nextUrls[m.id] ?? ""
                     let theatres = movieToTheatres[m.id] ?? []
+
+                    // Pull A-List eligibility (default false if missing)
+                    let aList = m.availableForAList ?? false
 
                     let isLive = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
                     let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
@@ -164,6 +168,7 @@ final class LimitedRunViewModel: ObservableObject {
                         posterUrl: posterUrl,
                         limitedRun: count < self.threshold,
                         theatreIds: theatres,
+                        availableForAList: aList,         // ← populated here
                         releaseType: releaseType
                     )
                 }
@@ -194,19 +199,25 @@ struct LimitedRunListView: View {
         return f
     }()
 
-    /// Apply visibility and release-type filters, then sorting
+    /// Apply hidden, release-type, **and** A-List filters, then sort
     private var sortedAndFiltered: [LimitedMovie] {
-        // 1) Include non-hidden movies only if their release-type toggle is on,
-        //    and include hidden movies only if “Hidden” toggle is on.
         let visible = vm.limitedMovies.filter { movie in
+            // 1) Hidden vs. release-type
             if userData.isHidden(movie: movie.id) {
-                return settings.showHiddenMovies
+                guard settings.showHiddenMovies else { return false }
             } else {
-                return settings.selectedReleaseTypes.contains(movie.releaseType)
+                guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
             }
+
+            // 2) A-List toggle
+            if settings.showAListOnly && !movie.availableForAList {
+                return false
+            }
+
+            return true
         }
 
-        // 2) Sort according to user choice
+        // 3) Sort per user choice
         switch settings.sortOption {
         case .alphabetical:
             return visible.sorted {
