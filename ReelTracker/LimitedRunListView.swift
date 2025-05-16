@@ -2,7 +2,7 @@
 //  LimitedRunListView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-16 to wire up AMC A-List filtering
+//  Updated on 2025-05-17 to use per-theatre threshold for limited-run logic.
 //
 
 import SwiftUI
@@ -20,13 +20,13 @@ enum ReleaseType: String, CaseIterable {
 struct LimitedMovie: Identifiable {
     let id: Int
     let name: String
-    let showtimeCount: Int
+    let showtimeCount: Int      // total across theatres, still useful for display
     let nextShowing: Date?
     let nextShowingUrl: String
     let posterUrl: String
-    let limitedRun: Bool
+    let limitedRun: Bool        // now based on per-theatre minimum
     let theatreIds: Set<Int>
-    let availableForAList: Bool       // ← new flag
+    let availableForAList: Bool
     let releaseType: ReleaseType
 }
 
@@ -81,9 +81,12 @@ final class LimitedRunViewModel: ObservableObject {
         // 2) Aggregate counts and next showtime
         showtimeGroup.notify(queue: .main) {
             let now = Date()
-            var counts: [Int: Int] = [:]
+            // total showtime counts per movie
+            var totalCounts: [Int: Int] = [:]
+            // next showing per movie
             var nextDates: [Int: Date] = [:]
             var nextUrls: [Int: String] = [:]
+            // theatres set per movie
             let movieToTheatres = Dictionary(
                 grouping: allTagged,
                 by: { $0.showtime.movieId }
@@ -91,7 +94,7 @@ final class LimitedRunViewModel: ObservableObject {
 
             for tagged in allTagged {
                 let mid = tagged.showtime.movieId
-                counts[mid, default: 0] += 1
+                totalCounts[mid, default: 0] += 1
                 if let dt = self.localFormatter.date(from: tagged.showtime.showDateTimeLocal),
                    dt >= now {
                     if let existing = nextDates[mid], dt < existing {
@@ -108,7 +111,7 @@ final class LimitedRunViewModel: ObservableObject {
             let movieGroup = DispatchGroup()
             var movies: [Movie] = []
 
-            for mid in counts.keys {
+            for mid in totalCounts.keys {
                 movieGroup.enter()
                 AMCAPIClient.shared.fetchMoviesByIds(ids: [mid]) { result in
                     if case .success(let resp) = result {
@@ -118,40 +121,56 @@ final class LimitedRunViewModel: ObservableObject {
                 }
             }
 
-            // 4) Classify each movie, now including A-List flag
+            // 4) Classify each movie, now using per-theatre threshold
             movieGroup.notify(queue: .main) {
                 let classified: [LimitedMovie] = movies.compactMap { m in
-                    let count = counts[m.id] ?? 0
+                    guard let theatres = movieToTheatres[m.id] else { return nil }
+
+                    // build per-theatre showtime counts for this movie
+                    var countsByTheatre: [Int: Int] = [:]
+                    allTagged
+                        .filter { $0.showtime.movieId == m.id }
+                        .forEach { entry in
+                            countsByTheatre[entry.theatreId, default: 0] += 1
+                        }
+                    // the smallest count across your chosen theatres
+                    let minCount = countsByTheatre.values.min() ?? 0
+
+                    // still keep total count for display
+                    let totalCount = totalCounts[m.id] ?? 0
                     let next = nextDates[m.id]
                     let url = nextUrls[m.id] ?? ""
-                    let theatres = movieToTheatres[m.id] ?? []
 
-                    // Pull A-List eligibility (default false if missing)
+                    // A-List eligibility
                     let aList = m.availableForAList ?? false
 
-                    let isLive = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
+                    // attribute checks
+                    let isLive    = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
                     let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
 
+                    // days since release
                     let daysSinceRelease: Int? = {
                         guard let rdStr = m.releaseDateUtc,
-                              let rd = self.isoFormatter.date(from: rdStr)
+                              let rd    = self.isoFormatter.date(from: rdStr)
                         else { return nil }
                         return Calendar.current.dateComponents([.day], from: rd, to: now).day
                     }()
 
+                    // decide releaseType
                     let releaseType: ReleaseType
                     if isLive {
                         releaseType = .live
                     } else if isSensory {
                         releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease, age > 14 && count <= self.threshold {
+                    } else if let age = daysSinceRelease, age > 14 && minCount <= self.threshold {
                         releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease, age <= 14 && count < self.threshold {
+                    } else if let age = daysSinceRelease, age <= 14 && minCount < self.threshold {
                         releaseType = .trueLimitedRun
                     } else {
                         return nil
                     }
 
+                    // pick a poster
                     let posterUrl: String = {
                         if let thumb = m.media?.posterDynamic180X74, !thumb.isEmpty {
                             return thumb
@@ -160,20 +179,20 @@ final class LimitedRunViewModel: ObservableObject {
                     }()
 
                     return LimitedMovie(
-                        id: m.id,
-                        name: m.name,
-                        showtimeCount: count,
-                        nextShowing: next,
-                        nextShowingUrl: url,
-                        posterUrl: posterUrl,
-                        limitedRun: count < self.threshold,
-                        theatreIds: theatres,
-                        availableForAList: aList,         // ← populated here
-                        releaseType: releaseType
+                        id:                m.id,
+                        name:              m.name,
+                        showtimeCount:     totalCount,
+                        nextShowing:       next,
+                        nextShowingUrl:    url,
+                        posterUrl:         posterUrl,
+                        limitedRun:        minCount < self.threshold,
+                        theatreIds:        theatres,
+                        availableForAList: aList,
+                        releaseType:       releaseType
                     )
                 }
 
-                // Initially sort by next showing date
+                // sort by next showing date
                 self.limitedMovies = classified.sorted {
                     let a = $0.nextShowing ?? .distantFuture
                     let b = $1.nextShowing ?? .distantFuture
@@ -199,7 +218,7 @@ struct LimitedRunListView: View {
         return f
     }()
 
-    /// Apply hidden, release-type, **and** A-List filters, then sort
+    /// Apply hidden, release-type, and A-List filters, then sort
     private var sortedAndFiltered: [LimitedMovie] {
         let visible = vm.limitedMovies.filter { movie in
             // 1) Hidden vs. release-type
@@ -208,12 +227,10 @@ struct LimitedRunListView: View {
             } else {
                 guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
             }
-
             // 2) A-List toggle
             if settings.showAListOnly && !movie.availableForAList {
                 return false
             }
-
             return true
         }
 
