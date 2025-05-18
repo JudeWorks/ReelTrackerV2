@@ -3,6 +3,9 @@
 //  ReelTracker
 //
 //  Updated on 2025-05-17 to use per-theatre threshold for limited-run logic.
+//  Updated on 2025-05-18 to add navigation to MovieDetailView.
+//  Updated on 2025-05-19 to remove unintended cache purges.
+//  Updated on 2025-05-20 to tighten limited-run to ≤10 days and ≤10 shows per theatre.
 //
 
 import SwiftUI
@@ -20,11 +23,11 @@ enum ReleaseType: String, CaseIterable {
 struct LimitedMovie: Identifiable {
     let id: Int
     let name: String
-    let showtimeCount: Int      // total across theatres, still useful for display
+    let showtimeCount: Int      // total across theatres
     let nextShowing: Date?
     let nextShowingUrl: String
     let posterUrl: String
-    let limitedRun: Bool        // now based on per-theatre minimum
+    let limitedRun: Bool
     let theatreIds: Set<Int>
     let availableForAList: Bool
     let releaseType: ReleaseType
@@ -81,12 +84,9 @@ final class LimitedRunViewModel: ObservableObject {
         // 2) Aggregate counts and next showtime
         showtimeGroup.notify(queue: .main) {
             let now = Date()
-            // total showtime counts per movie
             var totalCounts: [Int: Int] = [:]
-            // next showing per movie
             var nextDates: [Int: Date] = [:]
             var nextUrls: [Int: String] = [:]
-            // theatres set per movie
             let movieToTheatres = Dictionary(
                 grouping: allTagged,
                 by: { $0.showtime.movieId }
@@ -121,34 +121,28 @@ final class LimitedRunViewModel: ObservableObject {
                 }
             }
 
-            // 4) Classify each movie, now using per-theatre threshold
+            // 4) Classify each movie
             movieGroup.notify(queue: .main) {
                 let classified: [LimitedMovie] = movies.compactMap { m in
                     guard let theatres = movieToTheatres[m.id] else { return nil }
 
-                    // build per-theatre showtime counts for this movie
+                    // Per-theatre counts (ignore theatres with zero shows by grouping logic)
                     var countsByTheatre: [Int: Int] = [:]
                     allTagged
                         .filter { $0.showtime.movieId == m.id }
                         .forEach { entry in
                             countsByTheatre[entry.theatreId, default: 0] += 1
                         }
-                    // the smallest count across your chosen theatres
                     let minCount = countsByTheatre.values.min() ?? 0
-
-                    // still keep total count for display
                     let totalCount = totalCounts[m.id] ?? 0
                     let next = nextDates[m.id]
                     let url = nextUrls[m.id] ?? ""
-
-                    // A-List eligibility
                     let aList = m.availableForAList ?? false
 
-                    // attribute checks
                     let isLive    = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
                     let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
 
-                    // days since release
+                    // Days since AMC releaseDateUtc
                     let daysSinceRelease: Int? = {
                         guard let rdStr = m.releaseDateUtc,
                               let rd    = self.isoFormatter.date(from: rdStr)
@@ -156,21 +150,21 @@ final class LimitedRunViewModel: ObservableObject {
                         return Calendar.current.dateComponents([.day], from: rd, to: now).day
                     }()
 
-                    // decide releaseType
+                    // Determine releaseType with new 10-day / ≤10-shows logic
                     let releaseType: ReleaseType
                     if isLive {
                         releaseType = .live
                     } else if isSensory {
                         releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease, age > 14 && minCount <= self.threshold {
+                    } else if let age = daysSinceRelease, age > 10 && minCount <= self.threshold {
                         releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease, age <= 14 && minCount < self.threshold {
+                    } else if let age = daysSinceRelease, age <= 10 && minCount <= self.threshold {
                         releaseType = .trueLimitedRun
                     } else {
                         return nil
                     }
 
-                    // pick a poster
+                    // Pick poster thumbnail
                     let posterUrl: String = {
                         if let thumb = m.media?.posterDynamic180X74, !thumb.isEmpty {
                             return thumb
@@ -185,18 +179,15 @@ final class LimitedRunViewModel: ObservableObject {
                         nextShowing:       next,
                         nextShowingUrl:    url,
                         posterUrl:         posterUrl,
-                        limitedRun:        minCount < self.threshold,
+                        limitedRun:        minCount <= self.threshold,
                         theatreIds:        theatres,
                         availableForAList: aList,
                         releaseType:       releaseType
                     )
                 }
 
-                // sort by next showing date
                 self.limitedMovies = classified.sorted {
-                    let a = $0.nextShowing ?? .distantFuture
-                    let b = $1.nextShowing ?? .distantFuture
-                    return a < b
+                    ($0.nextShowing ?? .distantFuture) < ($1.nextShowing ?? .distantFuture)
                 }
                 self.isLoading = false
             }
@@ -221,20 +212,17 @@ struct LimitedRunListView: View {
     /// Apply hidden, release-type, and A-List filters, then sort
     private var sortedAndFiltered: [LimitedMovie] {
         let visible = vm.limitedMovies.filter { movie in
-            // 1) Hidden vs. release-type
             if userData.isHidden(movie: movie.id) {
                 guard settings.showHiddenMovies else { return false }
             } else {
                 guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
             }
-            // 2) A-List toggle
             if settings.showAListOnly && !movie.availableForAList {
                 return false
             }
             return true
         }
 
-        // 3) Sort per user choice
         switch settings.sortOption {
         case .alphabetical:
             return visible.sorted {
@@ -263,36 +251,38 @@ struct LimitedRunListView: View {
                     .foregroundColor(.secondary)
             } else {
                 List(sortedAndFiltered) { movie in
-                    HStack(alignment: .top) {
-                        CachedAsyncImage(
-                            urlString: movie.posterUrl,
-                            width: 60,
-                            height: 90
-                        )
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(movie.name)
-                                .font(.headline)
-                            Text("Showings Remaining: \(movie.showtimeCount)")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                            if let next = movie.nextShowing {
-                                Text("Next Showing: \(Self.displayFormatter.string(from: next))")
+                    NavigationLink(destination: MovieDetailView(movieId: movie.id)) {
+                        HStack(alignment: .top) {
+                            CachedAsyncImage(
+                                urlString: movie.posterUrl,
+                                width: 60,
+                                height: 90
+                            )
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(movie.name)
+                                    .font(.headline)
+                                Text("Showings Remaining: \(movie.showtimeCount)")
                                     .font(.subheadline)
                                     .foregroundColor(.secondary)
-                            }
-                            Text(movie.releaseType.rawValue)
-                                .font(.caption)
-                                .foregroundColor(.primary)
+                                if let next = movie.nextShowing {
+                                    Text("Next Showing: \(Self.displayFormatter.string(from: next))")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                }
+                                Text(movie.releaseType.rawValue)
+                                    .font(.caption)
+                                    .foregroundColor(.primary)
 
-                            let total = settings.selectedIds.count
-                            let playing = movie.theatreIds.count
-                            Text(
-                                playing == total
-                                    ? "Playing at all selected theatres"
-                                    : "Playing at \(playing) of \(total) theatres"
-                            )
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
+                                let total = settings.selectedIds.count
+                                let playing = movie.theatreIds.count
+                                Text(
+                                    playing == total
+                                        ? "Playing at all selected theatres"
+                                        : "Playing at \(playing) of \(total) theatres"
+                                )
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            }
                         }
                     }
                     .swipeActions(edge: .trailing) {
@@ -313,18 +303,16 @@ struct LimitedRunListView: View {
                 }
                 .refreshable {
                     vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))
-                    DataCache.shared.purgeExpiredEntries()
                 }
             }
         }
         .task(id: settings.selectedIds) {
             vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))
-            DataCache.shared.purgeExpiredEntries()
         }
     }
 }
 
-/// A SwiftUI view that caches and displays images from a URL, with retry and placeholder
+// Simple image loader with caching
 struct CachedAsyncImage: View {
     let urlString: String
     let width: CGFloat
@@ -350,13 +338,11 @@ struct CachedAsyncImage: View {
             ProgressView()
                 .frame(width: width, height: height)
                 .onAppear { loadImage() }
-
         case .success(let img):
             Image(uiImage: img)
                 .resizable()
                 .scaledToFit()
                 .frame(width: width, height: height)
-
         case .failure:
             Image(systemName: "photo")
                 .resizable()
@@ -370,13 +356,11 @@ struct CachedAsyncImage: View {
             state = .failure
             return
         }
-
         if let data = DataCache.shared.data(forKey: url.absoluteString),
            let img = UIImage(data: data) {
             state = .success(img)
             return
         }
-
         URLSession.shared.dataTask(with: url) { data, _, _ in
             if let d = data, let img = UIImage(data: d) {
                 DataCache.shared.store(d, forKey: url.absoluteString)

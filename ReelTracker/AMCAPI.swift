@@ -3,6 +3,7 @@
 //  ReelTracker
 //
 //  Updated on 2025-05-15 to include A-List eligibility, trailer support, and theatre amenities
+//  Updated on 2025-05-18 to add on-disk caching via DataCache
 //
 
 import Foundation
@@ -45,7 +46,7 @@ public struct Movie: Identifiable, Codable {
     public let releaseDateUtc: String?
     public let attributes: [Attribute]? // e.g. formats like "3D", "IMAX"
     public let media: MediaContainer?
-    public let availableForAList: Bool? // AMC A‑List eligibility flag
+    public let availableForAList: Bool? // AMC A-List eligibility flag
 }
 
 /// Showtime information for a movie at a theatre
@@ -106,7 +107,7 @@ public struct TheatresResponse: Codable {
 }
 public struct EmbeddedTheatres: Codable { public let theatres: [Theatre] }
 
-// MARK: - AMC API Client with Full Pagination
+// MARK: - AMC API Client with Full Pagination and Caching
 
 public class AMCAPIClient {
     public static let shared = AMCAPIClient()
@@ -123,27 +124,51 @@ public class AMCAPIClient {
         self.jsonDecoder.keyDecodingStrategy = .convertFromSnakeCase
     }
 
-    /// Basic request executor that injects the vendor key
+    /// Centralized request method with on-disk caching via DataCache
     private func request<T: Decodable>(
         _ url: URL,
         completion: @escaping (Result<T, APIError>) -> Void
     ) {
-        var req = URLRequest(url: url)
-        req.setValue(apiKey, forHTTPHeaderField: "X-AMC-Vendor-Key")
+        let cacheKey = url.absoluteString
 
-        URLSession.shared.dataTask(with: req) { data, response, error in
+        // 1) Attempt to load from cache
+        if let cachedData = DataCache.shared.data(forKey: cacheKey) {
+            do {
+                let decoded = try jsonDecoder.decode(T.self, from: cachedData)
+                completion(.success(decoded))
+                return
+            } catch {
+                // If decoding fails, fall through to network fetch
+                print("Cache decode failed for \(cacheKey): \(error). Fetching from network.")
+            }
+        }
+
+        // 2) Make network request
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-AMC-Vendor-Key")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
-                completion(.failure(.network(error))); return
+                completion(.failure(.network(error)))
+                return
             }
             guard let http = response as? HTTPURLResponse else {
-                completion(.failure(.unknown)); return
+                completion(.failure(.unknown))
+                return
             }
             guard (200..<300).contains(http.statusCode) else {
-                completion(.failure(.badResponse(statusCode: http.statusCode))); return
+                completion(.failure(.badResponse(statusCode: http.statusCode)))
+                return
             }
             guard let data = data else {
-                completion(.failure(.unknown)); return
+                completion(.failure(.unknown))
+                return
             }
+
+            // 3) Cache the raw JSON bytes for future use
+            DataCache.shared.store(data, forKey: cacheKey)
+
+            // 4) Decode and return
             do {
                 let decoded = try self.jsonDecoder.decode(T.self, from: data)
                 completion(.success(decoded))
@@ -205,10 +230,12 @@ public class AMCAPIClient {
             .init(name: "page-number", value: "\(pageNumber)"),
             .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
+        guard let initialURL = comps.url else {
+            completion(.failure(.invalidURL)); return
+        }
 
         fetchAllPages(
-            initialURL: initialURL,
+            initialURL:    initialURL,
             extractItems:   { $0._embedded.movies },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in
@@ -242,10 +269,12 @@ public class AMCAPIClient {
             .init(name: "page-number", value: "\(pageNumber)"),
             .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
+        guard let initialURL = comps.url else {
+            completion(.failure(.invalidURL)); return
+        }
 
         fetchAllPages(
-            initialURL: initialURL,
+            initialURL:    initialURL,
             extractItems:   { $0._embedded.movies },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in
@@ -277,10 +306,12 @@ public class AMCAPIClient {
             .init(name: "page-number", value: "\(pageNumber)"),
             .init(name: "page-size",   value: "\(pageSize)")
         ]
-        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
+        guard let initialURL = comps.url else {
+            completion(.failure(.invalidURL)); return
+        }
 
         fetchAllPages(
-            initialURL: initialURL,
+            initialURL:    initialURL,
             extractItems:   { $0._embedded.movies },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in
@@ -326,10 +357,12 @@ public class AMCAPIClient {
             items.append(.init(name: "postal-code", value: postal))
         }
         comps.queryItems = items
-        guard let initialURL = comps.url else { completion(.failure(.invalidURL)); return }
+        guard let initialURL = comps.url else {
+            completion(.failure(.invalidURL)); return
+        }
 
         fetchAllPages(
-            initialURL: initialURL,
+            initialURL:    initialURL,
             extractItems:   { $0._embedded.theatres },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in
@@ -381,10 +414,12 @@ public class AMCAPIClient {
             items.append(.init(name: "movie-id", value: "\(mid)"))
         }
         comps.queryItems = items
-        guard let finalURL = comps.url else { completion(.failure(.invalidURL)); return }
+        guard let initialURL = comps.url else {
+            completion(.failure(.invalidURL)); return
+        }
 
         fetchAllPages(
-            initialURL: finalURL,
+            initialURL:    initialURL,
             extractItems:   { $0._embedded.showtimes },
             extractNextURL: { $0._links?.next.flatMap { URL(string: $0.href) } },
             combineMeta:    { last, all in
