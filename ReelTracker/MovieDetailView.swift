@@ -1,11 +1,9 @@
+// MovieDetailView.swift
+// ReelTracker
 //
-//  MovieDetailView.swift
-//  ReelTracker
-//
-//  Created on 2025-05-19.
-//  A more polished, modern detail screen for a single movie,
-//  now always listing every selected theatre—even those with no showtimes.
-//
+// Created on 2025-05-19.
+// Updated on 2025-05-21 to align "Showtimes" header and theatre names
+// with the "Synopsis" section, using consistent card styling.
 
 import SwiftUI
 import AVKit
@@ -88,18 +86,26 @@ struct MovieDetailView: View {
                         Text(rating)
                             .font(.subheadline.bold())
                             .padding(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6).stroke())
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.primary)
+                            )
+                            .foregroundColor(.primary)
                     }
                     if let runtime = viewModel.movie?.runTime {
                         Label("\(runtime) min", systemImage: "clock")
                             .font(.subheadline)
+                            .foregroundColor(.primary)
                     }
                     if viewModel.movie?.availableForAList == true {
                         Text("A-List")
                             .font(.subheadline.bold())
                             .padding(6)
-                            .background(Color.accentColor.opacity(0.1))
-                            .cornerRadius(6)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.primary)
+                            )
+                            .foregroundColor(.primary)
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -110,6 +116,7 @@ struct MovieDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Synopsis")
                             .font(.headline)
+                            .foregroundColor(.primary)
                         Text(synopsis)
                             .font(.body)
                             .foregroundColor(.secondary)
@@ -127,6 +134,7 @@ struct MovieDetailView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Trailer")
                             .font(.headline)
+                            .foregroundColor(.primary)
                         VideoPlayer(player: AVPlayer(url: url))
                             .aspectRatio(16/9, contentMode: .fit)
                             .cornerRadius(12)
@@ -135,49 +143,57 @@ struct MovieDetailView: View {
                     .padding(.horizontal)
                 }
 
-                // MARK: Showtimes by Theatre
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Showtimes")
-                        .font(.headline)
-                    ForEach(settings.selectedTheatres) { theatre in
-                        // Always list each theatre, even if times is empty
-                        let times = viewModel.showtimesByTheatre[theatre.id] ?? []
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(theatre.name)
-                                .font(.subheadline.bold())
-                            if times.isEmpty {
-                                Text("No showtimes")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 10) {
-                                        ForEach(times, id: \.id) { st in
-                                            if let dt = Self.localFormatter.date(from: st.showDateTimeLocal) {
-                                                Button {
-                                                    openURL(URL(string: st.purchaseUrl)!)
-                                                } label: {
-                                                    Text(Self.displayFormatter.string(from: dt))
-                                                        .font(.caption)
-                                                        .padding(.vertical, 6)
-                                                        .padding(.horizontal, 12)
-                                                        .background(Color.accentColor.opacity(0.1))
-                                                        .cornerRadius(8)
+                // MARK: Showtimes by Theatre (aligned as a card)
+                if !viewModel.showtimesByTheatre.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Showtimes")
+                            .font(.headline)
+                            .foregroundColor(.primary)
+
+                        ForEach(settings.selectedTheatres) { theatre in
+                            let times = viewModel.showtimesByTheatre[theatre.id] ?? []
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(theatre.name)
+                                    .font(.subheadline.bold())
+                                    .foregroundColor(.primary)
+
+                                if times.isEmpty {
+                                    Text("No showtimes")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 10) {
+                                            ForEach(times, id: \.id) { st in
+                                                if let dt = Self.localFormatter.date(from: st.showDateTimeLocal) {
+                                                    Button {
+                                                        openURL(URL(string: st.purchaseUrl)!)
+                                                    } label: {
+                                                        Text(Self.displayFormatter.string(from: dt))
+                                                            .font(.caption)
+                                                            .foregroundColor(.primary)
+                                                            .padding(.vertical, 6)
+                                                            .padding(.horizontal, 12)
+                                                            .overlay(
+                                                                RoundedRectangle(cornerRadius: 8)
+                                                                    .stroke(Color.primary)
+                                                            )
+                                                    }
+                                                    .buttonStyle(.plain)
                                                 }
-                                                .buttonStyle(.plain)
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        .padding()
-                        .background(Color(.secondarySystemBackground))
-                        .cornerRadius(12)
-                        .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 2)
                     }
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(12)
+                    .shadow(color: Color.black.opacity(0.05), radius: 4, x: 0, y: 2)
+                    .padding(.horizontal)
                 }
-                .padding(.horizontal)
 
                 // MARK: Action Buttons
                 HStack(spacing: 20) {
@@ -194,7 +210,8 @@ struct MovieDetailView: View {
                         )
                         .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
+                    .tint(.primary)
 
                     Button {
                         if userData.isSeen(movie: movieId) {
@@ -210,13 +227,13 @@ struct MovieDetailView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .tint(.primary)
                 }
                 .padding(.horizontal)
                 .padding(.top, 12)
-
-            } // VStack
+            }
             .padding(.vertical)
-        } // ScrollView
+        }
         .navigationTitle(viewModel.movie?.name ?? "Details")
         .navigationBarTitleDisplayMode(.inline)
         .background(Color(.systemBackground))
@@ -228,8 +245,6 @@ struct MovieDetailView: View {
         }
     }
 }
-
-// MARK: – ViewModel
 
 final class MovieDetailViewModel: ObservableObject {
     @Published var movie: Movie?
@@ -247,7 +262,7 @@ final class MovieDetailViewModel: ObservableObject {
         isLoading = true
         showtimesByTheatre = [:]
 
-        // 1) Movie details
+        // Fetch movie details
         AMCAPIClient.shared.fetchMovieDetails(id: movieId) { [weak self] result in
             DispatchQueue.main.async {
                 if case .success(let m) = result {
@@ -256,7 +271,7 @@ final class MovieDetailViewModel: ObservableObject {
             }
         }
 
-        // 2) Showtimes per theatre
+        // Fetch showtimes per theatre
         let group = DispatchGroup()
         var grouped: [Int: [Showtime]] = [:]
 
@@ -273,7 +288,6 @@ final class MovieDetailViewModel: ObservableObject {
                    let self = self {
                     let valid = resp._embedded.showtimes
                     DispatchQueue.main.async {
-                        // Sort and assign even if empty
                         grouped[tid] = valid.sorted {
                             guard
                                 let d1 = self.localFormatter.date(from: $0.showDateTimeLocal),
@@ -295,14 +309,18 @@ final class MovieDetailViewModel: ObservableObject {
     }
 }
 
-// MARK: – Preview
-
 struct MovieDetailView_Previews: PreviewProvider {
     static var previews: some View {
         NavigationView {
             MovieDetailView(movieId: 123)
                 .environmentObject(SettingsViewModel())
                 .environmentObject(UserDataStore.shared)
+                .preferredColorScheme(.light)
+
+            MovieDetailView(movieId: 123)
+                .environmentObject(SettingsViewModel())
+                .environmentObject(UserDataStore.shared)
+                .preferredColorScheme(.dark)
         }
     }
 }

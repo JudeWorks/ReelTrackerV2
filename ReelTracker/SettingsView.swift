@@ -4,6 +4,7 @@
 //
 //  Updated on 2025-05-12 to fix theatre row tappability
 //  Updated on 2025-05-15 to add AMC A-List filter toggle
+//  Updated on 2025-05-23 to replace toggles with checkmark rows and add Done button
 //
 
 import SwiftUI
@@ -36,7 +37,7 @@ final class SettingsViewModel: ObservableObject {
     private let distanceKey             = "searchDistance"
     private let sortOptionKey           = "sortOption"
     private let showHiddenKey           = "showHiddenMovies"
-    private let showAListKey            = "showAListOnly" // NEW: key for AMC A-List filter
+    private let showAListKey            = "showAListOnly"
 
     // MARK: - Published properties with persistence
     @Published var zipCode: String {
@@ -47,9 +48,8 @@ final class SettingsViewModel: ObservableObject {
     }
     @Published var selectedReleaseTypes: Set<ReleaseType> {
         didSet {
-            // Persist raw values of selected ReleaseType
-            let rawValues = selectedReleaseTypes.map { $0.rawValue }
-            UserDefaults.standard.set(rawValues, forKey: selectedReleaseTypesKey)
+            let raw = selectedReleaseTypes.map { $0.rawValue }
+            UserDefaults.standard.set(raw, forKey: selectedReleaseTypesKey)
         }
     }
     @Published var searchDistance: Double {
@@ -79,42 +79,39 @@ final class SettingsViewModel: ObservableObject {
     private var lookupTask: Task<Void, Never>?
 
     init() {
-        // Load persisted settings
         zipCode = UserDefaults.standard.string(forKey: zipCodeKey) ?? ""
-        if let saved = UserDefaults.standard.array(forKey: selectedIdsKey) as? [Int] {
-            selectedIds = Set(saved)
+        if let arr = UserDefaults.standard.array(forKey: selectedIdsKey) as? [Int] {
+            selectedIds = Set(arr)
         } else {
             selectedIds = []
         }
-        if let rawSaved = UserDefaults.standard.array(forKey: selectedReleaseTypesKey) as? [String] {
-            let types = Set(rawSaved.compactMap { ReleaseType(rawValue: $0) })
+        if let raw = UserDefaults.standard.array(forKey: selectedReleaseTypesKey) as? [String] {
+            let types = Set(raw.compactMap { ReleaseType(rawValue: $0) })
             selectedReleaseTypes = types.isEmpty ? Set(ReleaseType.allCases) : types
         } else {
             selectedReleaseTypes = Set(ReleaseType.allCases)
         }
-        let savedDistance = UserDefaults.standard.double(forKey: distanceKey)
-        searchDistance = savedDistance > 0 ? savedDistance : 50
-        if let rawSort = UserDefaults.standard.string(forKey: sortOptionKey), let opt = SortOption(rawValue: rawSort) {
+        let savedDist = UserDefaults.standard.double(forKey: distanceKey)
+        searchDistance = savedDist > 0 ? savedDist : 50
+        if let rawSort = UserDefaults.standard.string(forKey: sortOptionKey),
+           let opt = SortOption(rawValue: rawSort) {
             sortOption = opt
         } else {
             sortOption = .nextShowingDate
         }
         showHiddenMovies = UserDefaults.standard.bool(forKey: showHiddenKey)
-        showAListOnly = UserDefaults.standard.bool(forKey: showAListKey)
+        showAListOnly    = UserDefaults.standard.bool(forKey: showAListKey)
 
-        // Initial lookup if ZIP is valid
         if zipCode.count == 5, Int(zipCode) != nil {
             lookupTheatres()
         }
     }
 
-    /// Cancel in-flight geocode or network lookup
     func cancelLookup() {
         lookupTask?.cancel()
         geocoder.cancelGeocode()
     }
 
-    /// Perform theatre lookup with current ZIP and radius
     func lookupTheatres() {
         cancelLookup()
         guard zipCode.count == 5, Int(zipCode) != nil else { return }
@@ -127,48 +124,48 @@ final class SettingsViewModel: ObservableObject {
             }
 
             // 1) Geocode ZIP
-            let placemarks: [CLPlacemark]
+            let marks: [CLPlacemark]
             do {
-                placemarks = try await withCheckedThrowingContinuation { cont in
-                    self.geocoder.geocodeAddressString(self.zipCode) { marks, error in
-                        if let error = error {
-                            cont.resume(throwing: error)
-                        } else {
-                            cont.resume(returning: marks ?? [])
-                        }
+                marks = try await withCheckedThrowingContinuation { cont in
+                    self.geocoder.geocodeAddressString(self.zipCode) { placemarks, error in
+                        if let err = error { cont.resume(throwing: err) }
+                        else              { cont.resume(returning: placemarks ?? []) }
                     }
                 }
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
                     self.isLoading = false
-                    self.theatres = []
+                    self.theatres  = []
                 }
                 return
             }
-            if Task.isCancelled { return }
-            guard let location = placemarks.first?.location else {
+            guard !Task.isCancelled, let loc = marks.first?.location else {
                 await MainActor.run {
                     self.isLoading = false
-                    self.theatres = []
+                    self.theatres  = []
                 }
                 return
             }
-            self.userLocation = location
+            self.userLocation = loc
 
-            // 2) Fetch theatres from API
+            // 2) Fetch theatres
             do {
-                let response = try await withCheckedThrowingContinuation { cont in
-                    AMCAPIClient.shared.fetchTheatres(pageNumber: 1, pageSize: 1000, postalCode: self.zipCode) { result in
-                        cont.resume(with: result.mapError { $0 })
+                let resp = try await withCheckedThrowingContinuation { cont in
+                    AMCAPIClient.shared.fetchTheatres(pageNumber: 1,
+                                                     pageSize: 1000,
+                                                     postalCode: self.zipCode) {
+                        cont.resume(with: $0.mapError { $0 })
                     }
                 }
-                if Task.isCancelled { return }
+                guard !Task.isCancelled else { return }
 
                 // 3) Filter by distance
-                let nearby = response._embedded.theatres.compactMap { th -> TheatreLocation? in
-                    guard let lat = th.location?.latitude, let lon = th.location?.longitude else { return nil }
-                    let miles = location.distance(from: CLLocation(latitude: lat, longitude: lon)) / 1609.34
+                let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
+                    guard let lat = th.location?.latitude,
+                          let lon = th.location?.longitude
+                    else { return nil }
+                    let miles = loc.distance(from: CLLocation(latitude: lat, longitude: lon)) / 1609.34
                     guard miles <= self.searchDistance else { return nil }
                     return TheatreLocation(
                         id: th.id,
@@ -177,7 +174,8 @@ final class SettingsViewModel: ObservableObject {
                         coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
                         distance: miles
                     )
-                }.sorted { $0.distance < $1.distance }
+                }
+                .sorted { $0.distance < $1.distance }
 
                 await MainActor.run {
                     self.theatres = nearby
@@ -187,13 +185,12 @@ final class SettingsViewModel: ObservableObject {
                 if Task.isCancelled { return }
                 await MainActor.run {
                     self.isLoading = false
-                    self.theatres = []
+                    self.theatres  = []
                 }
             }
         }
     }
 
-    /// Toggle a theatre's selection
     func toggleSelection(_ theatre: TheatreLocation) {
         if selectedIds.contains(theatre.id) {
             selectedIds.remove(theatre.id)
@@ -207,6 +204,7 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsViewModel
     @FocusState private var zipFieldFocused: Bool
     @State private var zipSearchWorkItem: DispatchWorkItem?
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationView {
@@ -214,32 +212,60 @@ struct SettingsView: View {
                 // Sort By
                 Section(header: Text("Sort By")) {
                     Picker("Sort By", selection: $settings.sortOption) {
-                        ForEach(SortOption.allCases, id: \.self) { option in
-                            Text(option.rawValue).tag(option)
+                        ForEach(SortOption.allCases) { opt in
+                            Text(opt.rawValue).tag(opt)
                         }
                     }
                     .pickerStyle(.segmented)
+                    .accentColor(.primary)
                 }
 
                 // Filters
                 Section(header: Text("Filters")) {
                     ForEach(ReleaseType.allCases, id: \.self) { type in
-                        Toggle(type.rawValue, isOn: Binding(
-                            get: { settings.selectedReleaseTypes.contains(type) },
-                            set: { newValue in
-                                if newValue {
-                                    settings.selectedReleaseTypes.insert(type)
-                                } else {
-                                    settings.selectedReleaseTypes.remove(type)
-                                }
+                        Button {
+                            if settings.selectedReleaseTypes.contains(type) {
+                                settings.selectedReleaseTypes.remove(type)
+                            } else {
+                                settings.selectedReleaseTypes.insert(type)
                             }
-                        ))
-                        .tint(.primary)
+                        } label: {
+                            HStack {
+                                Image(systemName: settings.selectedReleaseTypes.contains(type)
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(.primary)
+                                Text(type.rawValue)
+                                    .foregroundColor(.primary)
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
-                    Toggle("AMC A-List Eligible Only", isOn: $settings.showAListOnly)
-                        .tint(.primary)
-                    Toggle("Hidden", isOn: $settings.showHiddenMovies)
-                        .tint(.primary)
+
+                    Button {
+                        settings.showAListOnly.toggle()
+                    } label: {
+                        HStack {
+                            Image(systemName: settings.showAListOnly
+                                  ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(.primary)
+                            Text("AMC A-List Eligible Only")
+                                .foregroundColor(.primary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        settings.showHiddenMovies.toggle()
+                    } label: {
+                        HStack {
+                            Image(systemName: settings.showHiddenMovies
+                                  ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(.primary)
+                            Text("Hidden")
+                                .foregroundColor(.primary)
+                        }
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 // Search Area
@@ -270,7 +296,10 @@ struct SettingsView: View {
 
                     HStack {
                         Text("Distance: \(Int(settings.searchDistance)) mi")
-                        Slider(value: $settings.searchDistance, in: 1...100, step: 1)
+                            .foregroundColor(.primary)
+                        Slider(value: $settings.searchDistance,
+                               in: 1...100,
+                               step: 1)
                             .tint(.primary)
                             .onChange(of: settings.searchDistance) { _, _ in
                                 if settings.zipCode.count == 5 {
@@ -293,9 +322,12 @@ struct SettingsView: View {
                                 settings.toggleSelection(theatre)
                             } label: {
                                 HStack {
-                                    Image(systemName: settings.selectedIds.contains(theatre.id) ? "checkmark.circle.fill" : "circle")
+                                    Image(systemName: settings.selectedIds.contains(theatre.id)
+                                          ? "checkmark.circle.fill" : "circle")
+                                        .foregroundColor(.primary)
                                     VStack(alignment: .leading) {
                                         Text(theatre.name)
+                                            .foregroundColor(.primary)
                                         if let pc = theatre.postalCode {
                                             Text(pc)
                                                 .font(.caption)
@@ -307,7 +339,6 @@ struct SettingsView: View {
                                     }
                                     Spacer()
                                 }
-                                .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                         }
@@ -319,30 +350,32 @@ struct SettingsView: View {
                     Section(header: Text("Selected Theatres")) {
                         ForEach(settings.selectedTheatres) { theatre in
                             Text(theatre.name)
+                                .foregroundColor(.primary)
                         }
                     }
+                }
+
+                // Legal disclaimer
+                Section(footer:
+                    Text("ReelTracker is not affiliated with AMC Theatres. AMC® and its trademarks are the property of AMC. For informational purposes only.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                ) {
+                    EmptyView()
                 }
             }
             .accentColor(.primary)
             .navigationTitle("Settings")
-            .onChange(of: zipFieldFocused) { _, focused in
-                if !focused, settings.zipCode.count == 5, Int(settings.zipCode) != nil {
-                    settings.lookupTheatres()
-                }
-            }
-            .onChange(of: settings.zipCode) { _, newValue in
-                zipSearchWorkItem?.cancel()
-                let task = DispatchWorkItem {
-                    if newValue.count == 5, Int(newValue) != nil {
-                        settings.lookupTheatres()
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
                     }
+                    .foregroundColor(.primary)
                 }
-                zipSearchWorkItem = task
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: task)
             }
         }
-        .onDisappear {
-            settings.cancelLookup()
-        }
+        .onDisappear { settings.cancelLookup() }
     }
 }
