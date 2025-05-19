@@ -2,9 +2,8 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-12 to fix theatre row tappability
-//  Updated on 2025-05-15 to add AMC A-List filter toggle
-//  Updated on 2025-05-23 to replace toggles with checkmark rows and add Done button
+//  Updated on 2025-05-24 to add “Special Event” filter
+//  Updated on 2025-05-25 to reorder filters, rename labels, and add info popups
 //
 
 import SwiftUI
@@ -14,8 +13,8 @@ import CoreLocation
 // Sort options for how the movie list is ordered
 enum SortOption: String, CaseIterable, Identifiable {
     case alphabetical      = "A → Z"
-    case remainingShowings = "Showings Remaining"
     case nextShowingDate   = "Next Showing"
+    case remainingShowings = "Shows Left"
     var id: Self { self }
 }
 // ────────────────────────────────────────────────
@@ -27,6 +26,13 @@ struct TheatreLocation: Identifiable {
     let postalCode: String?
     let coordinate: CLLocationCoordinate2D
     let distance: Double    // miles
+}
+
+/// Simple container for presenting alerts
+private struct AlertItem: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
 }
 
 final class SettingsViewModel: ObservableObject {
@@ -48,7 +54,7 @@ final class SettingsViewModel: ObservableObject {
     }
     @Published var selectedReleaseTypes: Set<ReleaseType> {
         didSet {
-            let raw = selectedReleaseTypes.map { $0.rawValue }
+            let raw = selectedReleaseTypes.map(\.rawValue)
             UserDefaults.standard.set(raw, forKey: selectedReleaseTypesKey)
         }
     }
@@ -127,9 +133,9 @@ final class SettingsViewModel: ObservableObject {
             let marks: [CLPlacemark]
             do {
                 marks = try await withCheckedThrowingContinuation { cont in
-                    self.geocoder.geocodeAddressString(self.zipCode) { placemarks, error in
-                        if let err = error { cont.resume(throwing: err) }
-                        else              { cont.resume(returning: placemarks ?? []) }
+                    self.geocoder.geocodeAddressString(self.zipCode) { pl, err in
+                        if let err = err { cont.resume(throwing: err) }
+                        else             { cont.resume(returning: pl ?? []) }
                     }
                 }
             } catch {
@@ -152,30 +158,32 @@ final class SettingsViewModel: ObservableObject {
             // 2) Fetch theatres
             do {
                 let resp = try await withCheckedThrowingContinuation { cont in
-                    AMCAPIClient.shared.fetchTheatres(pageNumber: 1,
-                                                     pageSize: 1000,
-                                                     postalCode: self.zipCode) {
-                        cont.resume(with: $0.mapError { $0 })
+                    AMCAPIClient.shared.fetchTheatres(
+                        pageNumber: 1,
+                        pageSize: 1000,
+                        postalCode: self.zipCode
+                    ) { result in
+                        cont.resume(with: result.mapError { $0 })
                     }
                 }
                 guard !Task.isCancelled else { return }
 
                 // 3) Filter by distance
                 let nearby = resp._embedded.theatres.compactMap { th -> TheatreLocation? in
-                    guard let lat = th.location?.latitude,
-                          let lon = th.location?.longitude
+                    guard
+                        let lat = th.location?.latitude,
+                        let lon = th.location?.longitude
                     else { return nil }
                     let miles = loc.distance(from: CLLocation(latitude: lat, longitude: lon)) / 1609.34
                     guard miles <= self.searchDistance else { return nil }
                     return TheatreLocation(
-                        id: th.id,
-                        name: th.name,
+                        id:         th.id,
+                        name:       th.name,
                         postalCode: th.location?.postalCode,
                         coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                        distance: miles
+                        distance:   miles
                     )
-                }
-                .sorted { $0.distance < $1.distance }
+                }.sorted { $0.distance < $1.distance }
 
                 await MainActor.run {
                     self.theatres = nearby
@@ -205,6 +213,33 @@ struct SettingsView: View {
     @FocusState private var zipFieldFocused: Bool
     @State private var zipSearchWorkItem: DispatchWorkItem?
     @Environment(\.dismiss) private var dismiss
+    @State private var alertItem: AlertItem?
+
+    // Define filter-specific explainers
+    private let infoTexts: [ReleaseType: String] = [
+        .live:            "Includes live simulcasts and special broadcast events.",
+        .sensoryFriendly: "Shows adapted for sensory-sensitive viewers.",
+        .leavingSoon:     "Movies with only a few showings left across your selected theatres.",
+        .trueLimitedRun:  "Films that are still in theatres but only playing in a small number of locations for a short time.",
+        .specialEvent:    "New releases on their first day that have only a handful of showings, like premieres or special screenings."
+    ]
+
+    // Order and display names
+    private let orderedTypes: [ReleaseType] = [
+        .live,
+        .sensoryFriendly,
+        .leavingSoon,
+        .trueLimitedRun,
+        .specialEvent
+    ]
+    private func label(for type: ReleaseType) -> String {
+        switch type {
+        case .sensoryFriendly: return "Sensory Friendly"
+        case .trueLimitedRun:  return "Limited Run"
+        case .specialEvent:    return "Special Showing"
+        default:               return type.rawValue
+        }
+    }
 
     var body: some View {
         NavigationView {
@@ -222,53 +257,103 @@ struct SettingsView: View {
 
                 // Filters
                 Section(header: Text("Filters")) {
-                    ForEach(ReleaseType.allCases, id: \.self) { type in
-                        Button {
-                            if settings.selectedReleaseTypes.contains(type) {
-                                settings.selectedReleaseTypes.remove(type)
-                            } else {
-                                settings.selectedReleaseTypes.insert(type)
+                    // ReleaseType filters in custom order
+                    ForEach(orderedTypes, id: \.self) { type in
+                        HStack {
+                            Button {
+                                if settings.selectedReleaseTypes.contains(type) {
+                                    settings.selectedReleaseTypes.remove(type)
+                                } else {
+                                    settings.selectedReleaseTypes.insert(type)
+                                }
+                            } label: {
+                                HStack {
+                                    Image(systemName: settings.selectedReleaseTypes.contains(type)
+                                          ? "checkmark.circle.fill" : "circle")
+                                        .foregroundColor(.primary)
+                                    Text(label(for: type))
+                                        .foregroundColor(.primary)
+                                }
                             }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            Button(action: {
+                                if let text = infoTexts[type] {
+                                    alertItem = AlertItem(
+                                        title: label(for: type),
+                                        message: text
+                                    )
+                                }
+                            }) {
+                                Image(systemName: "info.circle")
+                                    .foregroundColor(.primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // A-List
+                    HStack {
+                        Button {
+                            settings.showAListOnly.toggle()
                         } label: {
                             HStack {
-                                Image(systemName: settings.selectedReleaseTypes.contains(type)
+                                Image(systemName: settings.showAListOnly
                                       ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(.primary)
-                                Text(type.rawValue)
+                                Text("AMC A-List Eligible")
                                     .foregroundColor(.primary)
                             }
                         }
                         .buttonStyle(.plain)
-                    }
 
-                    Button {
-                        settings.showAListOnly.toggle()
-                    } label: {
-                        HStack {
-                            Image(systemName: settings.showAListOnly
-                                  ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(.primary)
-                            Text("AMC A-List Eligible Only")
+                        Spacer()
+
+                        Button {
+                            alertItem = AlertItem(
+                                title: "AMC A-List Eligible",
+                                message: "Only shows eligible under AMC’s A-List subscription."
+                            )
+                        } label: {
+                            Image(systemName: "info.circle")
                                 .foregroundColor(.primary)
                         }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
 
-                    Button {
-                        settings.showHiddenMovies.toggle()
-                    } label: {
-                        HStack {
-                            Image(systemName: settings.showHiddenMovies
-                                  ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(.primary)
-                            Text("Hidden")
+                    // Hidden
+                    HStack {
+                        Button {
+                            settings.showHiddenMovies.toggle()
+                        } label: {
+                            HStack {
+                                Image(systemName: settings.showHiddenMovies
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(.primary)
+                                Text("Hidden")
+                                    .foregroundColor(.primary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+
+                        Spacer()
+
+                        Button {
+                            alertItem = AlertItem(
+                                title: "Hidden",
+                                message: "Movies you’ve chosen to hide will not appear in the main list."
+                            )
+                        } label: {
+                            Image(systemName: "info.circle")
                                 .foregroundColor(.primary)
                         }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
 
-                // Search Area
+                // Search Area (unchanged)…
                 Section(header: Text("Search Area")) {
                     HStack {
                         TextField("ZIP Code", text: $settings.zipCode)
@@ -309,7 +394,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Theatres List
+                // Theatres List (unchanged)…
                 Section(header: Text("Theatres within \(Int(settings.searchDistance)) miles")) {
                     if settings.isLoading {
                         ProgressView()
@@ -345,7 +430,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Selected Theatres Summary
+                // Selected Theatres Summary (unchanged)…
                 if !settings.selectedTheatres.isEmpty {
                     Section(header: Text("Selected Theatres")) {
                         ForEach(settings.selectedTheatres) { theatre in
@@ -355,7 +440,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Legal disclaimer
+                // Legal disclaimer (unchanged)…
                 Section(footer:
                     Text("ReelTracker is not affiliated with AMC Theatres. AMC® and its trademarks are the property of AMC. For informational purposes only.")
                         .font(.footnote)
@@ -369,11 +454,14 @@ struct SettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                    .foregroundColor(.primary)
+                    Button("Done") { dismiss() }
+                        .foregroundColor(.primary)
                 }
+            }
+            .alert(item: $alertItem) { ai in
+                Alert(title: Text(ai.title),
+                      message: Text(ai.message),
+                      dismissButton: .default(Text("OK")))
             }
         }
         .onDisappear { settings.cancelLookup() }

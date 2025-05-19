@@ -6,6 +6,9 @@
 //  Updated on 2025-05-18 to add navigation to MovieDetailView.
 //  Updated on 2025-05-19 to remove unintended cache purges.
 //  Updated on 2025-05-20 to tighten limited-run to ≤10 days and ≤10 shows per theatre.
+//  Updated on 2025-05-24 to add “Special Event” classification.
+//  Updated on 2025-05-26 to use a two-column grid with centered badges under posters.
+//  Updated on 2025-05-27 to increase text sizes by one step.
 //
 
 import SwiftUI
@@ -15,6 +18,7 @@ import UIKit
 enum ReleaseType: String, CaseIterable {
     case live             = "Live"
     case sensoryFriendly  = "Sensory-Friendly"
+    case specialEvent     = "Special Event"
     case leavingSoon      = "Leaving Soon"
     case trueLimitedRun   = "Limited Run"
 }
@@ -39,6 +43,7 @@ final class LimitedRunViewModel: ObservableObject {
     @Published var isLoading: Bool = false
 
     private let threshold = 10
+    private let specialThreshold = 5
     private let localFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
@@ -126,7 +131,7 @@ final class LimitedRunViewModel: ObservableObject {
                 let classified: [LimitedMovie] = movies.compactMap { m in
                     guard let theatres = movieToTheatres[m.id] else { return nil }
 
-                    // Per-theatre counts (ignore theatres with zero shows by grouping logic)
+                    // Per-theatre counts
                     var countsByTheatre: [Int: Int] = [:]
                     allTagged
                         .filter { $0.showtime.movieId == m.id }
@@ -150,15 +155,20 @@ final class LimitedRunViewModel: ObservableObject {
                         return Calendar.current.dateComponents([.day], from: rd, to: now).day
                     }()
 
-                    // Determine releaseType with new 10-day / ≤10-shows logic
+                    // Determine releaseType
                     let releaseType: ReleaseType
                     if isLive {
                         releaseType = .live
                     } else if isSensory {
                         releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease, age > 10 && minCount <= self.threshold {
+                    } else if let age = daysSinceRelease,
+                              age <= 1 && minCount <= self.specialThreshold {
+                        releaseType = .specialEvent
+                    } else if let age = daysSinceRelease,
+                              age > 10 && minCount <= self.threshold {
                         releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease, age <= 10 && minCount <= self.threshold {
+                    } else if let age = daysSinceRelease,
+                              age <= 10 && minCount <= self.threshold {
                         releaseType = .trueLimitedRun
                     } else {
                         return nil
@@ -199,6 +209,11 @@ struct LimitedRunListView: View {
     @EnvironmentObject var settings: SettingsViewModel
     @EnvironmentObject var userData: UserDataStore
     @StateObject private var vm = LimitedRunViewModel()
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 16),
+        GridItem(.flexible(), spacing: 16)
+    ]
 
     /// Formatter for “Next Showing”
     private static let displayFormatter: DateFormatter = {
@@ -244,62 +259,58 @@ struct LimitedRunListView: View {
             if settings.selectedIds.isEmpty {
                 Text("Please select theatres in Settings.")
                     .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding()
             } else if vm.isLoading {
                 ProgressView("Loading…")
             } else if sortedAndFiltered.isEmpty {
                 Text("No movies found for the selected filters.")
                     .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding()
             } else {
-                List(sortedAndFiltered) { movie in
-                    NavigationLink(destination: MovieDetailView(movieId: movie.id)) {
-                        HStack(alignment: .top) {
-                            CachedAsyncImage(
-                                urlString: movie.posterUrl,
-                                width: 60,
-                                height: 90
-                            )
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(movie.name)
-                                    .font(.headline)
-                                Text("Showings Remaining: \(movie.showtimeCount)")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                                if let next = movie.nextShowing {
-                                    Text("Next Showing: \(Self.displayFormatter.string(from: next))")
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 16) {
+                        ForEach(sortedAndFiltered) { movie in
+                            NavigationLink(destination: MovieDetailView(movieId: movie.id)) {
+                                VStack(spacing: 8) {
+                                    CachedAsyncImage(
+                                        urlString: movie.posterUrl,
+                                        width: UIScreen.main.bounds.width/2 - 24,
+                                        height: (UIScreen.main.bounds.width/2 - 24) * 1.5
+                                    )
+                                    .cornerRadius(8)
+                                    .clipped()
+
+                                    Text(movie.releaseType.rawValue)
+                                        .font(.caption).bold()
+                                        .padding(.vertical, 4)
+                                        .padding(.horizontal, 8)
+                                        .background(Color.primary.opacity(0.1))
+                                        .cornerRadius(8)
+
+                                    Text(movie.name)
+                                        .font(.headline)
+                                        .fontWeight(.semibold)
+                                        .multilineTextAlignment(.center)
+                                        .lineLimit(2)
+
+                                    Text("\(movie.showtimeCount) shows remaining")
                                         .font(.subheadline)
                                         .foregroundColor(.secondary)
-                                }
-                                Text(movie.releaseType.rawValue)
-                                    .font(.caption)
-                                    .foregroundColor(.primary)
 
-                                let total = settings.selectedIds.count
-                                let playing = movie.theatreIds.count
-                                Text(
-                                    playing == total
-                                        ? "Playing at all selected theatres"
-                                        : "Playing at \(playing) of \(total) theatres"
-                                )
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                                    if let next = movie.nextShowing {
+                                        Text("Next: \(Self.displayFormatter.string(from: next))")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .padding(8)
                             }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .swipeActions(edge: .trailing) {
-                        if userData.isHidden(movie: movie.id) {
-                            Button {
-                                userData.unhide(movie: movie.id)
-                            } label: {
-                                Label("Unhide", systemImage: "eye")
-                            }
-                        } else {
-                            Button(role: .destructive) {
-                                userData.hide(movie: movie.id)
-                            } label: {
-                                Label("Hide", systemImage: "eye.slash")
-                            }
-                        }
-                    }
+                    .padding(.horizontal, 8)
                 }
                 .refreshable {
                     vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))
@@ -341,8 +352,9 @@ struct CachedAsyncImage: View {
         case .success(let img):
             Image(uiImage: img)
                 .resizable()
-                .scaledToFit()
+                .scaledToFill()
                 .frame(width: width, height: height)
+                .clipped()
         case .failure:
             Image(systemName: "photo")
                 .resizable()
