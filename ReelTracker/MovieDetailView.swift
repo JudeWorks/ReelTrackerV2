@@ -4,6 +4,7 @@
 // Created on 2025-05-19.
 // Updated on 2025-05-21 to align "Showtimes" header and theatre names
 // with the "Synopsis" section, using consistent card styling.
+// Further updated on 2025-05-18 to show next showing date and remove action buttons.
 
 import SwiftUI
 import AVKit
@@ -17,12 +18,14 @@ struct MovieDetailView: View {
 
     @StateObject private var viewModel = MovieDetailViewModel()
 
+    // Formatter for parsing UTC release dates (unused now)
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
 
+    // Formatter for parsing local showtime strings
     private static let localFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
@@ -30,6 +33,7 @@ struct MovieDetailView: View {
         return f
     }()
 
+    // Formatter for display
     private static let displayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateStyle = .medium
@@ -38,11 +42,22 @@ struct MovieDetailView: View {
         return f
     }()
 
+    /// Compute the very next upcoming showtime across all theatres
+    private var nextShowingDate: Date? {
+        let allDates = viewModel.showtimesByTheatre.values
+            .flatMap { $0 }
+            .compactMap { Showtime in
+                Self.localFormatter.date(from: Showtime.showDateTimeLocal)
+            }
+            .sorted()
+        return allDates.first
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: 24) {
 
-                // MARK: Hero Poster with Title Overlay
+                // MARK: Hero Poster with Title & Next Showing Overlay
                 if let urlString = viewModel.movie?.media?.heroDesktopDynamic ?? viewModel.movie?.media?.posterDynamic,
                    let url = URL(string: urlString) {
                     ZStack(alignment: .bottom) {
@@ -67,9 +82,9 @@ struct MovieDetailView: View {
                                 .multilineTextAlignment(.center)
                                 .foregroundColor(.white)
 
-                            if let rd = viewModel.movie?.releaseDateUtc,
-                               let date = Self.isoFormatter.date(from: rd) {
-                                Text(Self.displayFormatter.string(from: date))
+                            // Next showing overlay
+                            if let nextDate = nextShowingDate {
+                                Text("Next Showing: \(Self.displayFormatter.string(from: nextDate))")
                                     .font(.subheadline)
                                     .foregroundColor(.white.opacity(0.8))
                             }
@@ -195,42 +210,8 @@ struct MovieDetailView: View {
                     .padding(.horizontal)
                 }
 
-                // MARK: Action Buttons
-                HStack(spacing: 20) {
-                    Button {
-                        if userData.isInWatchlist(movie: movieId) {
-                            userData.removeFromWatchlist(movie: movieId)
-                        } else {
-                            userData.addToWatchlist(movie: movieId)
-                        }
-                    } label: {
-                        Label(
-                            userData.isInWatchlist(movie: movieId) ? "In Watchlist" : "Add to Watchlist",
-                            systemImage: userData.isInWatchlist(movie: movieId) ? "bookmark.fill" : "bookmark"
-                        )
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.primary)
+                // MARK: (Removed action buttons section)
 
-                    Button {
-                        if userData.isSeen(movie: movieId) {
-                            userData.unmarkSeen(movie: movieId)
-                        } else {
-                            userData.markSeen(movie: movieId)
-                        }
-                    } label: {
-                        Label(
-                            userData.isSeen(movie: movieId) ? "Seen" : "Mark as Seen",
-                            systemImage: userData.isSeen(movie: movieId) ? "eye.fill" : "eye"
-                        )
-                        .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.primary)
-                }
-                .padding(.horizontal)
-                .padding(.top, 12)
             }
             .padding(.vertical)
         }
