@@ -4,6 +4,7 @@
 //
 //  Created on 5/9/25
 //  Updated on 5/16/25 to fix concurrency, unused variables, and A-List flag
+//  Updated on 5/20/25 to support theatre-specific time-zone parsing
 //
 
 import Foundation
@@ -55,16 +56,13 @@ actor AMCMovieFetchService {
 
     /// Concurrently fetch all showtimes across the given theatre IDs
     func fetchShowtimes(for theatreIds: [Int]) async throws -> [(theatreId: Int, showtime: Showtime)] {
-        return try await withThrowingTaskGroup(of: [(Int, Showtime)].self) { group in
-            // Kick off one child‐task per theatre
+        try await withThrowingTaskGroup(of: [(Int, Showtime)].self) { group in
             for id in theatreIds {
                 group.addTask {
                     let sts = try await self.fetchShowtimesOnce(theatreId: id)
-                    return sts.map { (theatreId: id, showtime: $0) }
+                    return sts.map { (id, $0) }
                 }
             }
-
-            // Collect all results
             var allTagged: [(Int, Showtime)] = []
             for try await chunk in group {
                 allTagged.append(contentsOf: chunk)
@@ -73,11 +71,26 @@ actor AMCMovieFetchService {
         }
     }
 
+    // MARK: - Time Zone Helper
+
+    /// Async wrapper to fetch theatre time zones
+    private func fetchTimeZones(for theatreIds: [Int]) async throws -> [Int: TimeZone] {
+        try await withCheckedThrowingContinuation { cont in
+            AMCAPIClient.shared.fetchTheatreTimeZones(for: theatreIds) { result in
+                switch result {
+                case .success(let map): cont.resume(returning: map)
+                case .failure(let err): cont.resume(throwing: err)
+                }
+            }
+        }
+    }
+
     // MARK: - Aggregation
 
-    /// Turn raw showtime tuples into per-movie aggregates
+    /// Turn raw showtime tuples into per-movie aggregates, respecting theatre time zones
     func aggregateShowtimes(
-        _ tagged: [(theatreId: Int, showtime: Showtime)]
+        _ tagged: [(theatreId: Int, showtime: Showtime)],
+        timeZones: [Int: TimeZone]
     ) -> [LimitedRunAggregate] {
         let now = Date()
         let byMovie = Dictionary(
@@ -87,21 +100,24 @@ actor AMCMovieFetchService {
 
         return byMovie.compactMap { movieId, entries in
             let count = entries.count
-
-            // Find the next future showing
+            
+            // Find the next future showing across all theatres
             let future = entries.compactMap { entry -> (Date, String)? in
-                let st = entry.showtime
+                // Parse with theatre-specific time zone
+                let tz = timeZones[entry.theatreId] ?? TimeZone.current
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                formatter.timeZone = tz
+                
                 guard
-                    let dt = isoFormatter.date(from: st.showDateTimeLocal),
+                    let dt = formatter.date(from: entry.showtime.showDateTimeLocal),
                     dt >= now
                 else { return nil }
-                return (dt, st.purchaseUrl)
+                return (dt, entry.showtime.purchaseUrl)
             }
             let (nextDate, nextURL) = future.min(by: { $0.0 < $1.0 }) ?? (nil, "")
 
-            // Which theatres are playing this movie?
             let theatreSet = Set(entries.map { $0.theatreId })
-
             return LimitedRunAggregate(
                 movieId:      movieId,
                 showtimeCount: count,
@@ -120,10 +136,8 @@ actor AMCMovieFetchService {
         return try await withCheckedThrowingContinuation { cont in
             AMCAPIClient.shared.fetchMoviesByIds(ids: ids) { result in
                 switch result {
-                case .success(let resp):
-                    cont.resume(returning: resp._embedded.movies)
-                case .failure(let error):
-                    cont.resume(throwing: error)
+                case .success(let resp): cont.resume(returning: resp._embedded.movies)
+                case .failure(let err): cont.resume(throwing: err)
                 }
             }
         }
@@ -144,11 +158,9 @@ actor AMCMovieFetchService {
         return movies.compactMap { movie in
             guard let agg = aggById[movie.id] else { return nil }
 
-            // Live / Sensory flags
             let isLive    = movie.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
             let isSensory = movie.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
 
-            // Days since release
             let daysSinceRelease: Int? = {
                 guard
                     let rdStr = movie.releaseDateUtc,
@@ -157,26 +169,25 @@ actor AMCMovieFetchService {
                 return Calendar.current.dateComponents([.day], from: rd, to: now).day
             }()
 
-            // Decide our ReleaseType
             let type: ReleaseType
             if isLive {
                 type = .live
             } else if isSensory {
                 type = .sensoryFriendly
-            } else if let age = daysSinceRelease, age > 14, agg.showtimeCount <= threshold {
+            } else if let age = daysSinceRelease, age <= 1 && agg.showtimeCount <= threshold {
+                type = .specialEvent
+            } else if let age = daysSinceRelease, age > threshold && agg.showtimeCount <= threshold {
                 type = .leavingSoon
-            } else if let age = daysSinceRelease, age <= 14, agg.showtimeCount < threshold {
+            } else if let age = daysSinceRelease, age <= threshold && agg.showtimeCount < threshold {
                 type = .trueLimitedRun
             } else {
                 return nil
             }
 
-            // Poster URL fallback
             let posterUrl = movie.media?.posterDynamic180X74
                          ?? movie.media?.posterDynamic
                          ?? ""
 
-            // AMC A-List eligibility
             let aList = movie.availableForAList ?? false
 
             return LimitedMovie(
@@ -199,13 +210,19 @@ actor AMCMovieFetchService {
 
     // MARK: - One-Stop Fetch
 
-    /// Fetch → Aggregate → Classify in one call
+    /// Fetch → TimeZones → Aggregate → Classify in one call
     func fetchLimitedMovies(
         for theatreIds: [Int]
     ) async throws -> [LimitedMovie] {
+        // 1) Parallel showtime fetch
         let tagged      = try await fetchShowtimes(for: theatreIds)
-        let aggregates  = aggregateShowtimes(tagged)
+        // 2) Fetch time zones
+        let zones       = try await fetchTimeZones(for: theatreIds)
+        // 3) Aggregate with correct parsing
+        let aggregates  = aggregateShowtimes(tagged, timeZones: zones)
+        // 4) Fetch movie details
         let movies      = try await fetchMovies(ids: aggregates.map { $0.movieId })
+        // 5) Classify
         return classify(movies: movies, aggregates: aggregates)
     }
 }

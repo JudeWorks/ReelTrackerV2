@@ -35,19 +35,13 @@ final class LimitedRunViewModel: ObservableObject {
 
     private let threshold = 10
     private let specialThreshold = 5
-    private let localFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        f.timeZone = .current
-        return f
-    }()
     private let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
 
-    /// Fetch and classify movies based on selected theatre IDs
+    /// Fetch and classify movies based on selected theatre IDs, using correct time zones
     func fetchLimitedMovies(theatreIds: [Int]) {
         // Generate a new token and assign
         let callID = UUID()
@@ -55,148 +49,172 @@ final class LimitedRunViewModel: ObservableObject {
 
         // If no theatres, clear and stop
         guard !theatreIds.isEmpty else {
-            limitedMovies = []
-            isLoading = false
+            DispatchQueue.main.async {
+                self.limitedMovies = []
+                self.isLoading = false
+            }
             return
         }
 
-        isLoading = true
-        // Local chunks per theatre to avoid concurrent writes
-        let theatreCount = theatreIds.count
-        var taggedChunks: [[(theatreId: Int, showtime: Showtime)]] = Array(repeating: [], count: theatreCount)
-        let showtimeGroup = DispatchGroup()
-
-        // 1) Fetch showtimes for each theatre
-        for (index, theatreId) in theatreIds.enumerated() {
-            showtimeGroup.enter()
-            AMCAPIClient.shared.fetchShowtimes(
-                theatreId: theatreId,
-                movieId: nil,
-                date: nil,
-                pageNumber: 1,
-                pageSize: 1000
-            ) { [weak self] result in
-                defer { showtimeGroup.leave() }
-                guard let self = self, self.fetchToken == callID else { return }
-                if case .success(let resp) = result {
-                    taggedChunks[index] = resp._embedded.showtimes.map { (theatreId: theatreId, showtime: $0) }
-                }
-            }
+        DispatchQueue.main.async {
+            self.isLoading = true
         }
 
-        // 2) Once all showtime fetches complete, merge and process
-        showtimeGroup.notify(queue: .main) { [weak self] in
+        // 1) Fetch theatre time zones
+        AMCAPIClient.shared.fetchTheatreTimeZones(for: theatreIds) { [weak self] tzResult in
             guard let self = self, self.fetchToken == callID else { return }
-
-            let allTagged = taggedChunks.flatMap { $0 }
-            let now = Date()
-            var totalCounts: [Int: Int] = [:]
-            var nextDates: [Int: Date] = [:]
-            var nextUrls: [Int: String] = [:]
-            let movieToTheatres = Dictionary(
-                grouping: allTagged,
-                by: { $0.showtime.movieId }
-            ).mapValues { Set($0.map { $0.theatreId }) }
-
-            // Aggregate counts and next showtime
-            for tagged in allTagged {
-                let mid = tagged.showtime.movieId
-                totalCounts[mid, default: 0] += 1
-                if let dt = self.localFormatter.date(from: tagged.showtime.showDateTimeLocal), dt >= now {
-                    if let existing = nextDates[mid], dt < existing {
-                        nextDates[mid] = dt
-                        nextUrls[mid] = tagged.showtime.purchaseUrl
-                    } else if nextDates[mid] == nil {
-                        nextDates[mid] = dt
-                        nextUrls[mid] = tagged.showtime.purchaseUrl
-                    }
-                }
-            }
-
-            // 3) Batch-fetch movie details
-            let movieIds = Array(totalCounts.keys)
-            AMCAPIClient.shared.fetchMoviesByIds(ids: movieIds) { [weak self] result in
-                guard let self = self, self.fetchToken == callID else { return }
-
-                var movies: [Movie] = []
-                if case .success(let resp) = result {
-                    movies = resp._embedded.movies
-                }
-
-                // 4) Classify each movie
-                let classified: [LimitedMovie] = movies.compactMap { m in
-                    guard let theatres = movieToTheatres[m.id] else { return nil }
-
-                    // Per-theatre counts
-                    var countsByTheatre: [Int: Int] = [:]
-                    allTagged
-                        .filter { $0.showtime.movieId == m.id }
-                        .forEach { entry in
-                            countsByTheatre[entry.theatreId, default: 0] += 1
-                        }
-                    let minCount = countsByTheatre.values.min() ?? 0
-                    let maxCount = countsByTheatre.values.max() ?? 0
-                    let totalCount = totalCounts[m.id] ?? 0
-                    let next = nextDates[m.id]
-                    let url = nextUrls[m.id] ?? ""
-                    let aList = m.availableForAList ?? false
-
-                    // Flags
-                    let isLive    = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
-                    let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
-
-                    // Days since release
-                    let daysSinceRelease: Int? = {
-                        guard let rdStr = m.releaseDateUtc,
-                              let rd    = self.isoFormatter.date(from: rdStr)
-                        else { return nil }
-                        return Calendar.current.dateComponents([.day], from: rd, to: now).day
-                    }()
-
-                    // Determine releaseType
-                    let releaseType: ReleaseType
-                    if isLive {
-                        releaseType = .live
-                    } else if isSensory {
-                        releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease, age <= 1 && maxCount <= self.specialThreshold {
-                        releaseType = .specialEvent
-                    } else if let age = daysSinceRelease, age > self.threshold && minCount <= self.threshold {
-                        releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease, age <= self.threshold && minCount <= self.threshold {
-                        releaseType = .trueLimitedRun
-                    } else {
-                        return nil
-                    }
-
-                    // Poster URL fallback
-                    let posterUrl: String = {
-                        if let thumb = m.media?.posterDynamic180X74, !thumb.isEmpty {
-                            return thumb
-                        }
-                        return m.media?.posterDynamic ?? ""
-                    }()
-
-                    return LimitedMovie(
-                        id:                m.id,
-                        name:              m.name,
-                        showtimeCount:     totalCount,
-                        nextShowing:       next,
-                        nextShowingUrl:    url,
-                        posterUrl:         posterUrl,
-                        limitedRun:        minCount <= self.threshold,
-                        theatreIds:        theatres,
-                        availableForAList: aList,
-                        releaseType:       releaseType
-                    )
-                }
-
-                // Publish results once and reset loading state
+            switch tzResult {
+            case .failure:
+                // On error, bail
                 DispatchQueue.main.async {
-                    self.limitedMovies = classified.sorted {
-                        ($0.nextShowing ?? Date.distantFuture) < ($1.nextShowing ?? Date.distantFuture)
-                    }
+                    self.limitedMovies = []
                     self.isLoading = false
+                }
+
+            case .success(let zoneMap):
+                // 2) Fetch showtimes for each theatre in parallel
+                let theatreCount = theatreIds.count
+                var taggedChunks: [[(theatreId: Int, showtime: Showtime)]] = Array(repeating: [], count: theatreCount)
+                let showtimeGroup = DispatchGroup()
+
+                for (index, theatreId) in theatreIds.enumerated() {
+                    showtimeGroup.enter()
+                    AMCAPIClient.shared.fetchShowtimes(
+                        theatreId: theatreId,
+                        movieId: nil,
+                        date: nil,
+                        pageNumber: 1,
+                        pageSize: 1000
+                    ) { [weak self] result in
+                        defer { showtimeGroup.leave() }
+                        guard let self = self, self.fetchToken == callID else { return }
+                        if case .success(let resp) = result {
+                            taggedChunks[index] = resp._embedded.showtimes.map { (theatreId: theatreId, showtime: $0) }
+                        }
+                    }
+                }
+
+                // 3) Once all showtime fetches complete, flatten and process
+                showtimeGroup.notify(queue: .main) { [weak self] in
+                    guard let self = self, self.fetchToken == callID else { return }
+
+                    let allTagged = taggedChunks.flatMap { $0 }
+                    let now = Date()
+                    var totalCounts: [Int: Int] = [:]
+                    var nextDates: [Int: Date] = [:]
+                    var nextUrls: [Int: String] = [:]
+                    let movieToTheatres = Dictionary(
+                        grouping: allTagged,
+                        by: { $0.showtime.movieId }
+                    ).mapValues { Set($0.map { $0.theatreId }) }
+
+                    // Aggregate counts and next showtime
+                    for tagged in allTagged {
+                        let mid = tagged.showtime.movieId
+                        totalCounts[mid, default: 0] += 1
+
+                        // Parse with theatre-specific time zone
+                        let zone = zoneMap[tagged.theatreId] ?? TimeZone.current
+                        let formatter = DateFormatter()
+                        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                        formatter.timeZone = zone
+                        if let dt = formatter.date(from: tagged.showtime.showDateTimeLocal), dt >= now {
+                            if let existing = nextDates[mid], dt < existing {
+                                nextDates[mid] = dt
+                                nextUrls[mid] = tagged.showtime.purchaseUrl
+                            } else if nextDates[mid] == nil {
+                                nextDates[mid] = dt
+                                nextUrls[mid] = tagged.showtime.purchaseUrl
+                            }
+                        }
+                    }
+
+                    // 4) Batch-fetch movie details
+                    let movieIds = Array(totalCounts.keys)
+                    AMCAPIClient.shared.fetchMoviesByIds(ids: movieIds) { [weak self] result in
+                        guard let self = self, self.fetchToken == callID else { return }
+
+                        var movies: [Movie] = []
+                        if case .success(let resp) = result {
+                            movies = resp._embedded.movies
+                        }
+
+                        // Classify each movie
+                        let classified: [LimitedMovie] = movies.compactMap { m in
+                            guard let theatres = movieToTheatres[m.id] else { return nil }
+
+                            // Per-theatre counts
+                            var countsByTheatre: [Int: Int] = [:]
+                            allTagged
+                                .filter { $0.showtime.movieId == m.id }
+                                .forEach { entry in
+                                    countsByTheatre[entry.theatreId, default: 0] += 1
+                                }
+                            let minCount = countsByTheatre.values.min() ?? 0
+                            let maxCount = countsByTheatre.values.max() ?? 0
+                            let totalCount = totalCounts[m.id] ?? 0
+                            let next = nextDates[m.id]
+                            let url = nextUrls[m.id] ?? ""
+                            let aList = m.availableForAList ?? false
+
+                            // Flags
+                            let isLive    = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
+                            let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
+
+                            // Days since release
+                            let daysSinceRelease: Int? = {
+                                guard let rdStr = m.releaseDateUtc,
+                                      let rd    = self.isoFormatter.date(from: rdStr)
+                                else { return nil }
+                                return Calendar.current.dateComponents([.day], from: rd, to: now).day
+                            }()
+
+                            // Determine releaseType
+                            let releaseType: ReleaseType
+                            if isLive {
+                                releaseType = .live
+                            } else if isSensory {
+                                releaseType = .sensoryFriendly
+                            } else if let age = daysSinceRelease, age <= 1 && maxCount <= self.specialThreshold {
+                                releaseType = .specialEvent
+                            } else if let age = daysSinceRelease, age > self.threshold && minCount <= self.threshold {
+                                releaseType = .leavingSoon
+                            } else if let age = daysSinceRelease, age <= self.threshold && minCount <= self.threshold {
+                                releaseType = .trueLimitedRun
+                            } else {
+                                return nil
+                            }
+
+                            // Poster URL fallback
+                            let posterUrl: String = {
+                                if let thumb = m.media?.posterDynamic180X74, !thumb.isEmpty {
+                                    return thumb
+                                }
+                                return m.media?.posterDynamic ?? ""
+                            }()
+
+                            return LimitedMovie(
+                                id:                m.id,
+                                name:              m.name,
+                                showtimeCount:     totalCount,
+                                nextShowing:       next,
+                                nextShowingUrl:    url,
+                                posterUrl:         posterUrl,
+                                limitedRun:        minCount <= self.threshold,
+                                theatreIds:        theatres,
+                                availableForAList: aList,
+                                releaseType:       releaseType
+                            )
+                        }
+
+                        // Publish results once and reset loading state
+                        DispatchQueue.main.async {
+                            self.limitedMovies = classified.sorted {
+                                ($0.nextShowing ?? Date.distantFuture) < ($1.nextShowing ?? Date.distantFuture)
+                            }
+                            self.isLoading = false
+                        }
+                    }
                 }
             }
         }

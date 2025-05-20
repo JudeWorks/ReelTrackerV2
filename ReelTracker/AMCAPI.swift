@@ -4,6 +4,7 @@
 //
 //  Updated on 2025-05-15 to include A-List eligibility, trailer support, and theatre amenities
 //  Updated on 2025-05-18 to add on-disk caching via DataCache
+//  Updated on 2025-05-20 to support theatre-specific time-zone parsing
 //
 
 import Foundation
@@ -70,7 +71,7 @@ public struct Location: Codable {
 public struct Theatre: Identifiable, Codable {
     public let id: Int
     public let name: String
-    public let timeZone: String?
+    public let timeZone: String?        // IANA time-zone identifier, e.g. "America/Denver"
     public let location: Location?
     public let attributes: [Attribute]? // Theatre amenities (e.g. "Dolby Cinema", "Recliners")
 }
@@ -114,6 +115,9 @@ public class AMCAPIClient {
     private let apiKey: String = "ABE142C9-AC7A-4947-94A3-5094CC0FBDBF"
     private let baseURL: URL
     private let jsonDecoder: JSONDecoder
+
+    /// Cache of fetched theatre time zones
+    private var theatreTimeZoneCache: [Int: TimeZone] = [:]
 
     private init() {
         guard let url = URL(string: "https://api.amctheatres.com/v2") else {
@@ -208,6 +212,49 @@ public class AMCAPIClient {
         }
 
         fetch(initialURL)
+    }
+
+    // MARK: - Time Zone Support
+
+    /// Fetch time-zone objects for a set of theatre IDs, caching results
+    public func fetchTheatreTimeZones(
+        for theatreIds: [Int],
+        completion: @escaping (Result<[Int: TimeZone], APIError>) -> Void
+    ) {
+        var zoneMap: [Int: TimeZone] = [:]
+        var fetchError: APIError?
+        let group = DispatchGroup()
+
+        for id in theatreIds {
+            if let tz = theatreTimeZoneCache[id] {
+                zoneMap[id] = tz
+            } else {
+                group.enter()
+                fetchTheatreDetails(id: id) { result in
+                    defer { group.leave() }
+                    switch result {
+                    case .success(let theatre):
+                        if let tzId = theatre.timeZone,
+                           let tz = TimeZone(identifier: tzId) {
+                            zoneMap[id] = tz
+                            self.theatreTimeZoneCache[id] = tz
+                        } else {
+                            zoneMap[id] = TimeZone.current
+                        }
+                    case .failure(let error):
+                        fetchError = error
+                    }
+                }
+            }
+        }
+
+        group.notify(queue: .main) {
+            if let err = fetchError {
+                completion(.failure(err))
+            } else {
+                completion(.success(zoneMap))
+            }
+        }
     }
 
     // MARK: - Movies
@@ -327,7 +374,7 @@ public class AMCAPIClient {
         )
     }
 
-    /// Fetch detailed info for a single movie by ID
+    /// Fetch detailed info
     public func fetchMovieDetails(
         id: Int,
         completion: @escaping (Result<Movie, APIError>) -> Void
