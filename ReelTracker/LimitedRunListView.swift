@@ -1,16 +1,3 @@
-//
-//  LimitedRunListView.swift
-//  ReelTracker
-//
-//  Updated on 2025-05-17 to use per-theatre threshold for limited-run logic.
-//  Updated on 2025-05-18 to add navigation to MovieDetailView.
-//  Updated on 2025-05-19 to remove unintended cache purges.
-//  Updated on 2025-05-20 to tighten limited-run to ≤10 days and ≤10 shows per theatre.
-//  Updated on 2025-05-24 to add “Special Event” classification.
-//  Updated on 2025-05-26 to use a two-column grid with centered badges under posters.
-//  Updated on 2025-05-27 to increase text sizes by one step.
-//
-
 import SwiftUI
 import UIKit
 
@@ -38,9 +25,13 @@ struct LimitedMovie: Identifiable {
 }
 
 /// ViewModel for fetching, filtering, and classifying limited-run movies
+@MainActor
 final class LimitedRunViewModel: ObservableObject {
     @Published var limitedMovies: [LimitedMovie] = []
     @Published var isLoading: Bool = false
+
+    /// Token to identify the current fetch session and ignore stale callbacks
+    private var fetchToken: UUID?
 
     private let threshold = 10
     private let specialThreshold = 5
@@ -58,17 +49,25 @@ final class LimitedRunViewModel: ObservableObject {
 
     /// Fetch and classify movies based on selected theatre IDs
     func fetchLimitedMovies(theatreIds: [Int]) {
+        // Generate a new token and assign
+        let callID = UUID()
+        fetchToken = callID
+
+        // If no theatres, clear and stop
         guard !theatreIds.isEmpty else {
             limitedMovies = []
+            isLoading = false
             return
         }
 
         isLoading = true
-        var allTagged: [(theatreId: Int, showtime: Showtime)] = []
+        // Local chunks per theatre to avoid concurrent writes
+        let theatreCount = theatreIds.count
+        var taggedChunks: [[(theatreId: Int, showtime: Showtime)]] = Array(repeating: [], count: theatreCount)
         let showtimeGroup = DispatchGroup()
 
         // 1) Fetch showtimes for each theatre
-        for theatreId in theatreIds {
+        for (index, theatreId) in theatreIds.enumerated() {
             showtimeGroup.enter()
             AMCAPIClient.shared.fetchShowtimes(
                 theatreId: theatreId,
@@ -76,18 +75,20 @@ final class LimitedRunViewModel: ObservableObject {
                 date: nil,
                 pageNumber: 1,
                 pageSize: 1000
-            ) { result in
+            ) { [weak self] result in
+                defer { showtimeGroup.leave() }
+                guard let self = self, self.fetchToken == callID else { return }
                 if case .success(let resp) = result {
-                    resp._embedded.showtimes.forEach { st in
-                        allTagged.append((theatreId: theatreId, showtime: st))
-                    }
+                    taggedChunks[index] = resp._embedded.showtimes.map { (theatreId: theatreId, showtime: $0) }
                 }
-                showtimeGroup.leave()
             }
         }
 
-        // 2) Aggregate counts and next showtime
-        showtimeGroup.notify(queue: .main) {
+        // 2) Once all showtime fetches complete, merge and process
+        showtimeGroup.notify(queue: .main) { [weak self] in
+            guard let self = self, self.fetchToken == callID else { return }
+
+            let allTagged = taggedChunks.flatMap { $0 }
             let now = Date()
             var totalCounts: [Int: Int] = [:]
             var nextDates: [Int: Date] = [:]
@@ -97,11 +98,11 @@ final class LimitedRunViewModel: ObservableObject {
                 by: { $0.showtime.movieId }
             ).mapValues { Set($0.map { $0.theatreId }) }
 
+            // Aggregate counts and next showtime
             for tagged in allTagged {
                 let mid = tagged.showtime.movieId
                 totalCounts[mid, default: 0] += 1
-                if let dt = self.localFormatter.date(from: tagged.showtime.showDateTimeLocal),
-                   dt >= now {
+                if let dt = self.localFormatter.date(from: tagged.showtime.showDateTimeLocal), dt >= now {
                     if let existing = nextDates[mid], dt < existing {
                         nextDates[mid] = dt
                         nextUrls[mid] = tagged.showtime.purchaseUrl
@@ -112,22 +113,17 @@ final class LimitedRunViewModel: ObservableObject {
                 }
             }
 
-            // 3) Fetch movie details
-            let movieGroup = DispatchGroup()
-            var movies: [Movie] = []
+            // 3) Batch-fetch movie details
+            let movieIds = Array(totalCounts.keys)
+            AMCAPIClient.shared.fetchMoviesByIds(ids: movieIds) { [weak self] result in
+                guard let self = self, self.fetchToken == callID else { return }
 
-            for mid in totalCounts.keys {
-                movieGroup.enter()
-                AMCAPIClient.shared.fetchMoviesByIds(ids: [mid]) { result in
-                    if case .success(let resp) = result {
-                        movies.append(contentsOf: resp._embedded.movies)
-                    }
-                    movieGroup.leave()
+                var movies: [Movie] = []
+                if case .success(let resp) = result {
+                    movies = resp._embedded.movies
                 }
-            }
 
-            // 4) Classify each movie
-            movieGroup.notify(queue: .main) {
+                // 4) Classify each movie
                 let classified: [LimitedMovie] = movies.compactMap { m in
                     guard let theatres = movieToTheatres[m.id] else { return nil }
 
@@ -139,15 +135,17 @@ final class LimitedRunViewModel: ObservableObject {
                             countsByTheatre[entry.theatreId, default: 0] += 1
                         }
                     let minCount = countsByTheatre.values.min() ?? 0
+                    let maxCount = countsByTheatre.values.max() ?? 0
                     let totalCount = totalCounts[m.id] ?? 0
                     let next = nextDates[m.id]
                     let url = nextUrls[m.id] ?? ""
                     let aList = m.availableForAList ?? false
 
+                    // Flags
                     let isLive    = m.attributes?.contains { $0.code.lowercased().contains("live") } ?? false
                     let isSensory = m.attributes?.contains { $0.code.lowercased().contains("sensory") } ?? false
 
-                    // Days since AMC releaseDateUtc
+                    // Days since release
                     let daysSinceRelease: Int? = {
                         guard let rdStr = m.releaseDateUtc,
                               let rd    = self.isoFormatter.date(from: rdStr)
@@ -161,20 +159,17 @@ final class LimitedRunViewModel: ObservableObject {
                         releaseType = .live
                     } else if isSensory {
                         releaseType = .sensoryFriendly
-                    } else if let age = daysSinceRelease,
-                              age <= 1 && minCount <= self.specialThreshold {
+                    } else if let age = daysSinceRelease, age <= 1 && maxCount <= self.specialThreshold {
                         releaseType = .specialEvent
-                    } else if let age = daysSinceRelease,
-                              age > 10 && minCount <= self.threshold {
+                    } else if let age = daysSinceRelease, age > self.threshold && minCount <= self.threshold {
                         releaseType = .leavingSoon
-                    } else if let age = daysSinceRelease,
-                              age <= 10 && minCount <= self.threshold {
+                    } else if let age = daysSinceRelease, age <= self.threshold && minCount <= self.threshold {
                         releaseType = .trueLimitedRun
                     } else {
                         return nil
                     }
 
-                    // Pick poster thumbnail
+                    // Poster URL fallback
                     let posterUrl: String = {
                         if let thumb = m.media?.posterDynamic180X74, !thumb.isEmpty {
                             return thumb
@@ -196,10 +191,13 @@ final class LimitedRunViewModel: ObservableObject {
                     )
                 }
 
-                self.limitedMovies = classified.sorted {
-                    ($0.nextShowing ?? .distantFuture) < ($1.nextShowing ?? .distantFuture)
+                // Publish results once and reset loading state
+                DispatchQueue.main.async {
+                    self.limitedMovies = classified.sorted {
+                        ($0.nextShowing ?? Date.distantFuture) < ($1.nextShowing ?? Date.distantFuture)
+                    }
+                    self.isLoading = false
                 }
-                self.isLoading = false
             }
         }
     }
@@ -227,28 +225,21 @@ struct LimitedRunListView: View {
     /// Apply hidden, release-type, and A-List filters, then sort
     private var sortedAndFiltered: [LimitedMovie] {
         let visible = vm.limitedMovies.filter { movie in
-            if userData.isHidden(movie: movie.id) {
-                guard settings.showHiddenMovies else { return false }
-            } else {
-                guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
-            }
-            if settings.showAListOnly && !movie.availableForAList {
-                return false
-            }
+            if userData.isHidden(movie: movie.id) { return false }
+            guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
+            if settings.showAListOnly && !movie.availableForAList { return false }
             return true
         }
 
         switch settings.sortOption {
         case .alphabetical:
-            return visible.sorted {
-                $0.name.localizedStandardCompare($1.name) == .orderedAscending
-            }
+            return visible.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         case .remainingShowings:
             return visible.sorted { $0.showtimeCount > $1.showtimeCount }
         case .nextShowingDate:
             return visible.sorted {
-                let a = $0.nextShowing ?? .distantFuture
-                let b = $1.nextShowing ?? .distantFuture
+                let a = $0.nextShowing ?? Date.distantFuture
+                let b = $1.nextShowing ?? Date.distantFuture
                 return a < b
             }
         }

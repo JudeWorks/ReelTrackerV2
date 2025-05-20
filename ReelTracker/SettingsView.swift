@@ -42,7 +42,6 @@ final class SettingsViewModel: ObservableObject {
     private let selectedReleaseTypesKey = "selectedReleaseTypes"
     private let distanceKey             = "searchDistance"
     private let sortOptionKey           = "sortOption"
-    private let showHiddenKey           = "showHiddenMovies"
     private let showAListKey            = "showAListOnly"
 
     // MARK: - Published properties with persistence
@@ -63,9 +62,6 @@ final class SettingsViewModel: ObservableObject {
     }
     @Published var sortOption: SortOption {
         didSet { UserDefaults.standard.set(sortOption.rawValue, forKey: sortOptionKey) }
-    }
-    @Published var showHiddenMovies: Bool {
-        didSet { UserDefaults.standard.set(showHiddenMovies, forKey: showHiddenKey) }
     }
     @Published var showAListOnly: Bool {
         didSet { UserDefaults.standard.set(showAListOnly, forKey: showAListKey) }
@@ -105,8 +101,7 @@ final class SettingsViewModel: ObservableObject {
         } else {
             sortOption = .nextShowingDate
         }
-        showHiddenMovies = UserDefaults.standard.bool(forKey: showHiddenKey)
-        showAListOnly    = UserDefaults.standard.bool(forKey: showAListKey)
+        showAListOnly = UserDefaults.standard.bool(forKey: showAListKey)
 
         if zipCode.count == 5, Int(zipCode) != nil {
             lookupTheatres()
@@ -322,38 +317,9 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.plain)
                     }
-
-                    // Hidden
-                    HStack {
-                        Button {
-                            settings.showHiddenMovies.toggle()
-                        } label: {
-                            HStack {
-                                Image(systemName: settings.showHiddenMovies
-                                      ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(.primary)
-                                Text("Hidden")
-                                    .foregroundColor(.primary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer()
-
-                        Button {
-                            alertItem = AlertItem(
-                                title: "Hidden",
-                                message: "Movies you’ve chosen to hide will not appear in the main list."
-                            )
-                        } label: {
-                            Image(systemName: "info.circle")
-                                .foregroundColor(.primary)
-                        }
-                        .buttonStyle(.plain)
-                    }
                 }
 
-                // Search Area (unchanged)…
+                // Search Area
                 Section(header: Text("Search Area")) {
                     HStack {
                         TextField("ZIP Code", text: $settings.zipCode)
@@ -394,7 +360,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Theatres List (unchanged)…
+                // Theatres List
                 Section(header: Text("Theatres within \(Int(settings.searchDistance)) miles")) {
                     if settings.isLoading {
                         ProgressView()
@@ -430,7 +396,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Selected Theatres Summary (unchanged)…
+                // Selected Theatres Summary
                 if !settings.selectedTheatres.isEmpty {
                     Section(header: Text("Selected Theatres")) {
                         ForEach(settings.selectedTheatres) { theatre in
@@ -440,7 +406,7 @@ struct SettingsView: View {
                     }
                 }
 
-                // Legal disclaimer (unchanged)…
+                // Legal disclaimer
                 Section(footer:
                     Text("ReelTracker is not affiliated with AMC Theatres. AMC® and its trademarks are the property of AMC. For informational purposes only.")
                         .font(.footnote)
