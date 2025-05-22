@@ -5,6 +5,7 @@
 // Updated on 2025-05-21 to align "Showtimes" header and theatre names
 // with the "Synopsis" section, using consistent card styling.
 // Further updated on 2025-05-18 to show next showing date and remove action buttons.
+// Updated on 2025-05-22 to use OptimizedAsyncImage
 
 import SwiftUI
 import AVKit
@@ -61,7 +62,7 @@ struct MovieDetailView: View {
                 if let urlString = viewModel.movie?.media?.heroDesktopDynamic ?? viewModel.movie?.media?.posterDynamic,
                    let url = URL(string: urlString) {
                     ZStack(alignment: .bottom) {
-                        CachedAsyncImage(
+                        OptimizedAsyncImage(
                             urlString: url.absoluteString,
                             width: UIScreen.main.bounds.width,
                             height: 240
@@ -203,6 +204,7 @@ struct MovieDetailView: View {
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(12)
@@ -255,6 +257,7 @@ final class MovieDetailViewModel: ObservableObject {
         // Fetch showtimes per theatre
         let group = DispatchGroup()
         var grouped: [Int: [Showtime]] = [:]
+        let now = Date()
 
         for tid in theatreIds {
             group.enter()
@@ -267,9 +270,12 @@ final class MovieDetailViewModel: ObservableObject {
             ) { [weak self] result in
                 if case .success(let resp) = result,
                    let self = self {
-                    let valid = resp._embedded.showtimes
+                    // Filter to only future showtimes
+                    let futureShowtimes = resp._embedded.showtimes.filter { showtime in
+                        self.localFormatter.date(from: showtime.showDateTimeLocal).map { $0 >= now } ?? false
+                    }
                     DispatchQueue.main.async {
-                        grouped[tid] = valid.sorted {
+                        grouped[tid] = futureShowtimes.sorted {
                             guard
                                 let d1 = self.localFormatter.date(from: $0.showDateTimeLocal),
                                 let d2 = self.localFormatter.date(from: $1.showDateTimeLocal)

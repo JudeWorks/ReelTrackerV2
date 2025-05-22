@@ -2,8 +2,9 @@
 //  SettingsView.swift
 //  ReelTracker
 //
-//  Updated on 2025-05-24 to add “Special Event” filter
+//  Updated on 2025-05-24 to add "Special Event" filter
 //  Updated on 2025-05-25 to reorder filters, rename labels, and add info popups
+//  Updated on 2025-05-22 to merge Special Event into Limited Release
 //
 
 import SwiftUI
@@ -89,6 +90,7 @@ final class SettingsViewModel: ObservableObject {
         }
         if let raw = UserDefaults.standard.array(forKey: selectedReleaseTypesKey) as? [String] {
             let types = Set(raw.compactMap { ReleaseType(rawValue: $0) })
+            // If we have any types after conversion, use them; otherwise use all
             selectedReleaseTypes = types.isEmpty ? Set(ReleaseType.allCases) : types
         } else {
             selectedReleaseTypes = Set(ReleaseType.allCases)
@@ -215,8 +217,7 @@ struct SettingsView: View {
         .live:            "Includes live simulcasts and special broadcast events.",
         .sensoryFriendly: "Shows adapted for sensory-sensitive viewers.",
         .leavingSoon:     "Movies with only a few showings left across your selected theatres.",
-        .trueLimitedRun:  "Films that are still in theatres but only playing in a small number of locations for a short time.",
-        .specialEvent:    "New releases on their first day that have only a handful of showings, like premieres or special screenings."
+        .limitedRelease:  "Films with limited showings, including new releases and special screenings."
     ]
 
     // Order and display names
@@ -224,14 +225,12 @@ struct SettingsView: View {
         .live,
         .sensoryFriendly,
         .leavingSoon,
-        .trueLimitedRun,
-        .specialEvent
+        .limitedRelease
     ]
     private func label(for type: ReleaseType) -> String {
         switch type {
         case .sensoryFriendly: return "Sensory Friendly"
-        case .trueLimitedRun:  return "Limited Run"
-        case .specialEvent:    return "Special Showing"
+        case .limitedRelease:  return "Limited Release"
         default:               return type.rawValue
         }
     }
@@ -309,7 +308,7 @@ struct SettingsView: View {
                         Button {
                             alertItem = AlertItem(
                                 title: "AMC A-List Eligible",
-                                message: "Only shows eligible under AMC’s A-List subscription."
+                                message: "Only shows eligible under AMC's A-List subscription."
                             )
                         } label: {
                             Image(systemName: "info.circle")
