@@ -56,27 +56,46 @@ struct LimitedRunListView: View {
         return f
     }()
 
-    /// Apply hidden, release-type, and A-List filters, then sort
-    private var sortedAndFiltered: [LimitedMovie] {
-        let visible = vm.limitedMovies.filter { movie in
+    /// Apply hidden, release-type, and A-List filters, then group and sort
+    private var groupedMovies: [(type: ReleaseType, movies: [LimitedMovie])] {
+        // First, filter movies
+        let filtered = vm.limitedMovies.filter { movie in
             if userData.isHidden(movie: movie.id) { return false }
             guard settings.selectedReleaseTypes.contains(movie.releaseType) else { return false }
             if settings.showAListOnly && !movie.availableForAList { return false }
             return true
         }
-
-        switch settings.sortOption {
-        case .alphabetical:
-            return visible.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        case .remainingShowings:
-            return visible.sorted { $0.showtimeCount > $1.showtimeCount }
-        case .nextShowingDate:
-            return visible.sorted {
-                let a = $0.nextShowing ?? Date.distantFuture
-                let b = $1.nextShowing ?? Date.distantFuture
-                return a < b
+        
+        // Group by release type
+        let grouped = Dictionary(grouping: filtered) { $0.releaseType }
+        
+        // Create ordered sections with Limited Release first, then Leaving Soon
+        var sections: [(type: ReleaseType, movies: [LimitedMovie])] = []
+        
+        // Add sections in preferred order
+        let orderedTypes: [ReleaseType] = [.limitedRelease, .leavingSoon, .live, .sensoryFriendly]
+        
+        for type in orderedTypes {
+            if let movies = grouped[type], !movies.isEmpty {
+                // Sort movies within each section
+                let sorted: [LimitedMovie]
+                switch settings.sortOption {
+                case .alphabetical:
+                    sorted = movies.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                case .remainingShowings:
+                    sorted = movies.sorted { $0.showtimeCount > $1.showtimeCount }
+                case .nextShowingDate:
+                    sorted = movies.sorted {
+                        let a = $0.nextShowing ?? Date.distantFuture
+                        let b = $1.nextShowing ?? Date.distantFuture
+                        return a < b
+                    }
+                }
+                sections.append((type: type, movies: sorted))
             }
         }
+        
+        return sections
     }
     
     /// Format next showing date in a concise way
@@ -102,6 +121,16 @@ struct LimitedRunListView: View {
             return formatter.string(from: date)
         }
     }
+    
+    /// Get display name for release type
+    private func sectionTitle(for type: ReleaseType) -> String {
+        switch type {
+        case .limitedRelease: return "Limited Release"
+        case .leavingSoon: return "Leaving Soon"
+        case .live: return "Live Events"
+        case .sensoryFriendly: return "Sensory Friendly"
+        }
+    }
 
     var body: some View {
         Group {
@@ -112,67 +141,84 @@ struct LimitedRunListView: View {
                     .padding()
             } else if vm.isLoading {
                 ProgressView("Loading…")
-            } else if sortedAndFiltered.isEmpty {
+            } else if groupedMovies.isEmpty {
                 Text("No movies found for the selected filters.")
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding()
             } else {
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(sortedAndFiltered) { movie in
-                            NavigationLink(destination: MovieDetailView(movieId: movie.id)) {
-                                VStack(alignment: .center, spacing: 8) {
-                                    OptimizedAsyncImage(
-                                        urlString: movie.posterUrl,
-                                        width: UIScreen.main.bounds.width/2 - 24,
-                                        height: (UIScreen.main.bounds.width/2 - 24) * 1.5
-                                    )
-                                    .cornerRadius(8)
-                                    .clipped()
+                    LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                        ForEach(groupedMovies, id: \.type) { section in
+                            Section {
+                                LazyVGrid(columns: columns, spacing: 16) {
+                                    ForEach(section.movies) { movie in
+                                        NavigationLink(destination: MovieDetailView(movieId: movie.id)) {
+                                            VStack(alignment: .center, spacing: 8) {
+                                                OptimizedAsyncImage(
+                                                    urlString: movie.posterUrl,
+                                                    width: UIScreen.main.bounds.width/2 - 24,
+                                                    height: (UIScreen.main.bounds.width/2 - 24) * 1.5
+                                                )
+                                                .cornerRadius(8)
+                                                .clipped()
 
-                                    Text(movie.releaseType.rawValue)
-                                        .font(.caption).bold()
-                                        .padding(.vertical, 4)
-                                        .padding(.horizontal, 8)
-                                        .background(Color.primary.opacity(0.1))
-                                        .cornerRadius(8)
+                                                Text(movie.name)
+                                                    .font(.headline)
+                                                    .fontWeight(.semibold)
+                                                    .multilineTextAlignment(.center)
+                                                    .lineLimit(2)
+                                                    .frame(height: 44)
 
-                                    Text(movie.name)
-                                        .font(.headline)
-                                        .fontWeight(.semibold)
-                                        .multilineTextAlignment(.center)
-                                        .lineLimit(2)
-                                        .frame(height: 44)
-
-                                    VStack(spacing: 4) {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "ticket.fill")
-                                                .font(.subheadline)
-                                            Text("\(movie.showtimeCount) showings")
-                                                .font(.subheadline)
-                                        }
-                                        .foregroundColor(.secondary)
-                                        
-                                        if let next = movie.nextShowing {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "clock.fill")
-                                                    .font(.subheadline)
-                                                Text(formatNextShowing(next))
-                                                    .font(.subheadline)
+                                                VStack(spacing: 4) {
+                                                    HStack(spacing: 4) {
+                                                        Image(systemName: "ticket.fill")
+                                                            .font(.subheadline)
+                                                        Text("\(movie.showtimeCount) showings")
+                                                            .font(.subheadline)
+                                                    }
+                                                    .foregroundColor(.secondary)
+                                                    
+                                                    if let next = movie.nextShowing {
+                                                        HStack(spacing: 4) {
+                                                            Image(systemName: "clock.fill")
+                                                                .font(.subheadline)
+                                                            Text(formatNextShowing(next))
+                                                                .font(.subheadline)
+                                                        }
+                                                        .foregroundColor(.secondary)
+                                                    }
+                                                }
+                                                .frame(height: 44)
                                             }
-                                            .foregroundColor(.secondary)
+                                            .padding(8)
+                                            .frame(maxHeight: .infinity)
                                         }
+                                        .buttonStyle(.plain)
                                     }
-                                    .frame(height: 44)
                                 }
-                                .padding(8)
-                                .frame(maxHeight: .infinity)
+                                .padding(.horizontal, 8)
+                                .padding(.bottom, 24)
+                            } header: {
+                                HStack {
+                                    Text(sectionTitle(for: section.type))
+                                        .font(.title2)
+                                        .fontWeight(.bold)
+                                        .foregroundColor(.primary)
+                                    
+                                    Spacer()
+                                    
+                                    Text("\(section.movies.count)")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                }
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(.systemBackground).opacity(0.95))
                             }
-                            .buttonStyle(.plain)
                         }
                     }
-                    .padding(.horizontal, 8)
                 }
                 .refreshable {
                     vm.fetchLimitedMovies(theatreIds: Array(settings.selectedIds))

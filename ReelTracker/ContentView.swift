@@ -2,6 +2,7 @@
 // ReelTracker
 //
 // Updated on 2025-05-21 to ensure the navigation bar uses dynamic black & white text.
+// Updated on 2025-05-22 to add collapsing navigation bar
 
 import SwiftUI
 
@@ -15,12 +16,15 @@ struct ContentView: View {
             Group {
                 if settings.selectedIds.isEmpty {
                     OnboardingView(showingSettings: $showingSettings)
+                        .navigationTitle("Reel Tracker")
+                        .navigationBarTitleDisplayMode(.inline)
                 } else {
                     LimitedRunListView()
+                        .navigationBarHidden(false)
+                        .navigationBarTitleDisplayMode(.large)
+                        .navigationTitle("Reel Tracker")
                 }
             }
-            .navigationTitle("Reel Tracker")
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 Button {
                     showingSettings = true
