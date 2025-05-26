@@ -235,6 +235,27 @@ struct SettingsView: View {
         }
     }
 
+    /// Schedules or re-schedules a delayed theatre lookup if ZIP code is valid.
+    private func scheduleDelayedZipSearch() {
+        // Cancel any previously scheduled work item
+        zipSearchWorkItem?.cancel()
+
+        // Ensure ZIP code is 5 digits and a number before scheduling
+        guard settings.zipCode.count == 5, Int(settings.zipCode) != nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem {
+            // Re-check conditions inside the closure, as state might have changed
+            // between scheduling and execution. The lookupTheatres() itself also has guards.
+            if settings.zipCode.count == 5, Int(settings.zipCode) != nil {
+                settings.lookupTheatres()
+            }
+        }
+        self.zipSearchWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
+    }
+
     var body: some View {
         NavigationView {
             Form {
@@ -325,16 +346,24 @@ struct SettingsView: View {
                             .keyboardType(.numberPad)
                             .focused($zipFieldFocused)
 
+                        // Conditionally show Search Button or ProgressView
                         if !settings.zipCode.isEmpty {
-                            Button {
-                                zipFieldFocused = false
-                                settings.lookupTheatres()
-                            } label: {
-                                Image(systemName: "magnifyingglass.circle.fill")
-                                    .imageScale(.large)
-                                    .foregroundColor(.primary)
+                            if settings.isLoading {
+                                ProgressView()
+                                    .frame(width: 28, height: 28) // Give it a consistent size
+                                    .padding(.leading, 5) // Adjust spacing if needed
+                            } else {
+                                Button {
+                                    zipSearchWorkItem?.cancel() // Cancel delayed search if manual search is tapped
+                                    zipFieldFocused = false
+                                    settings.lookupTheatres()
+                                } label: {
+                                    Image(systemName: "magnifyingglass.circle.fill")
+                                        .imageScale(.large)
+                                        .foregroundColor(.primary)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                     .toolbar {
@@ -352,8 +381,10 @@ struct SettingsView: View {
                                step: 1)
                             .tint(.primary)
                             .onChange(of: settings.searchDistance) { _, _ in
-                                if settings.zipCode.count == 5 {
-                                    settings.lookupTheatres()
+                                // Cancel any pending zip search if distance changes
+                                zipSearchWorkItem?.cancel()
+                                if settings.zipCode.count == 5, Int(settings.zipCode) != nil {
+                                    settings.lookupTheatres() // Perform immediate search
                                 }
                             }
                     }
@@ -361,7 +392,7 @@ struct SettingsView: View {
 
                 // Theatres List
                 Section(header: Text("Theatres within \(Int(settings.searchDistance)) miles")) {
-                    if settings.isLoading {
+                    if settings.isLoading && settings.theatres.isEmpty { // Show ProgressView here only if theatres list is empty during load
                         ProgressView()
                     } else if settings.theatres.isEmpty {
                         Text("No theatres found.")
@@ -428,7 +459,24 @@ struct SettingsView: View {
                       message: Text(ai.message),
                       dismissButton: .default(Text("OK")))
             }
+            // Detect changes to zipCode to trigger delayed search
+            .onChange(of: settings.zipCode) { _, newValue in
+                zipSearchWorkItem?.cancel() // Cancel previous work item on any change
+                if newValue.count == 5, Int(newValue) != nil {
+                    scheduleDelayedZipSearch()
+                }
+            }
+            // Detect when the zipCode field loses focus
+            .onChange(of: zipFieldFocused) { _, isFocused in
+                if !isFocused { // TextField lost focus
+                    // scheduleDelayedZipSearch already checks count and cancels previous
+                    scheduleDelayedZipSearch()
+                }
+            }
         }
-        .onDisappear { settings.cancelLookup() }
+        .onDisappear {
+            settings.cancelLookup()
+            zipSearchWorkItem?.cancel() // Also cancel delayed search if view disappears
+        }
     }
 }
